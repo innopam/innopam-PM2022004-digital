@@ -13,6 +13,8 @@ services:
     environment:
       PROJ_LIB: /opt/conda/share/proj
       GDAL_DATA: /opt/conda/share/gdal
+    # env_file:
+    #   - ./.env
     deploy:
       resources:
         reservations:
@@ -20,5 +22,5 @@ services:
             - driver: nvidia
               count: all
               capabilities: [ gpu ]
-    command: sh -c "python /workspace/predict.py --output_path /workspace/out2/out.gpkg"
-    # command: sh -c "python /workspace/predict.py --output_path /workspace/out/out.gpkg --img_1 /workspace/sample_data/A --img_2 /workspace/sample_data/B"
+    # command: sh -c "python /workspace/predict.py --output_path /workspace/out2/out.gpkg"
+    command: sh -c "python /workspace/predict.py --output_path ${output_path} --img_1 ${img_1} --img_2 ${img_2}"
