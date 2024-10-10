@@ -1,0 +1,24 @@
+version: '3.9'
+
+services:
+  opencd:
+    image: opencd_pytorch:latest
+    volumes:
+      - ./workspace:/workspace
+      # - [host]:[container]
+      # build:
+      #   dockerfile: ./dockerfile
+      #   shm_size: '30gb'
+    shm_size: '30gb'
+    environment:
+      PROJ_LIB: /opt/conda/share/proj
+      GDAL_DATA: /opt/conda/share/gdal
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [ gpu ]
+    command: sh -c "python /workspace/predict.py --output_path /workspace/out2/out.gpkg"
+    # command: sh -c "python /workspace/predict.py --output_path /workspace/out/out.gpkg --img_1 /workspace/sample_data/A --img_2 /workspace/sample_data/B"
