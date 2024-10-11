@@ -24,6 +24,16 @@ export img_1=/workspace/sample_data/A img_2=/workspace/sample_data/B output_path
 - output
     - out.gpkg, out.json
     - 좌표는 EPSG:5186
+### 예시
+- input: Before 이미지(2020년도 377051713도엽)
+
+<img width="566" alt="스크린샷 2024-10-11 오후 3 26 52" src="https://github.com/user-attachments/assets/110e42da-d42e-441d-a968-8c8857b2d58e"></br>
+- input: After 이미지(2022년도 377051713도엽)
+
+<img width="563" alt="스크린샷 2024-10-11 오후 3 27 07" src="https://github.com/user-attachments/assets/2ea5e7bf-fdb0-49ee-a848-212479c5fd40"></br>
+- output: Before 이미지(2022년도 377051713도엽)에 추론결과 OVERLAP
+
+<img width="563" alt="스크린샷 2024-10-11 오후 3 27 25" src="https://github.com/user-attachments/assets/9ac12269-27d6-47e7-b405-263399ffb570">
 
 ## 4. directory 구조
 ```bash
