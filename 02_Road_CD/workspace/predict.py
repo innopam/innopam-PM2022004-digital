@@ -31,11 +31,16 @@ from opencd.apis import OpenCDInferencer
 
 def make_args():
     """
-    before(.tif): 폴더 경로(tiling)
-    after(.tif): 폴더 경로(tiling)
-    output(.gpkg): 파일 경로
+    img_1(.tif): Before 이미지(도엽별 항공영상)가 담긴 폴더 경로
+    img_2(.tif): After 이미지(도엽별 항공영상)가 담긴 폴더 경로
+    output_path(.gpkg): 최종 결과물 경로
     """
     parser = argparse.ArgumentParser()
+
+    parser.add_argument("--img_1", type=str, default="/workspace/sample_data/A")
+    parser.add_argument("--img_2", type=str, default="/workspace/sample_data/B")
+    parser.add_argument("--output_path", type=str, default="/workspace/out/out.gpkg")
+
     parser.add_argument(
         "--config", type=str, default="/workspace/model/ban_vit-l14-georsclip.py"
     )
@@ -44,9 +49,7 @@ def make_args():
         type=str,
         default="/workspace/model/ban_vit-l14-georsclip_iter_8000.pth",
     )
-    parser.add_argument("--img_1", type=str, default="/workspace/sample_data/A")
-    parser.add_argument("--img_2", type=str, default="/workspace/sample_data/B")
-    parser.add_argument("--output_path", type=str, default="/workspace/out/out.gpkg")
+    parser.add_argument("--px", type=int, default=512)
 
     return parser
 
@@ -63,9 +66,17 @@ def load_model(model_path, weight_path):
     return model
 
 
+def retile(input, output, px):
+    subprocess.run(
+        "gdal_retile.py -ps %s %s -of GTiff -ot Byte -targetDir %s %s"
+        % (str(px), str(px), output, input),
+        shell=True,
+    )
+
+
 def run_cd(model, image_set):
     """
-    image_set: [[img1_before, img1_after], [img2_before, img2_after]]
+    image_set: [[img1_before, img1_after], [img2_before, img2_after], ..]
     """
     # predict_array = model(image_set)["predictions"]
     predict_array = model(image_set, return_datasamples=True)
@@ -167,21 +178,24 @@ if __name__ == "__main__":
     pth = args.pth
     folder_1 = args.img_1
     folder_2 = args.img_2
+    px = args.px
     root_path = os.path.dirname(args.output_path)
     out_name = os.path.basename(args.output_path)
 
-    # 결과물 폴더 생성
+    # 결과물, 중간산출물 폴더 생성
     output = os.path.join(root_path, "output")
     output_conf = os.path.join(root_path, "output_conf")
     post_processed = os.path.join(root_path, "post_processed")
     output_gpkg = os.path.join(root_path, "output_gpkg")
     post_processed_gpkg = os.path.join(root_path, "post_processed_gpkg")
+    tile = os.path.join(root_path, "tile")
     new_folders = [
         output,
         output_conf,
         post_processed,
         output_gpkg,
         post_processed_gpkg,
+        tile,
     ]
 
     for folder in new_folders:
@@ -197,62 +211,91 @@ if __name__ == "__main__":
     # 모델 생성
     model = load_model(config, pth)
 
-    # 이미지 셋 리스트 생성
-    dataset_li = []
-    file_li = sorted(os.listdir(folder_1))
-    for file in file_li:
-        cd_set = [os.path.join(folder_1, file), os.path.join(folder_2, file)]
-        dataset_li.append(cd_set)
+    # 항공영상 도엽별 Retile
+    before_li = sorted(os.listdir(folder_1))
+    after_li = sorted(os.listdir(folder_2))
 
-    # 이미지 셋트별로 변화탐지 추론실시(추론 -> 좌표넣기 -> 후처리)
-    for dataset in tqdm(dataset_li):
+    # Before, After 의 도엽별 이미지의 이름이 동일해야함
+    if before_li != after_li:
+        log["status"] = "failed"
+        with open(log_path, "w") as logfile:
+            json.dump(log, logfile)
+        raise Exception("Image sets of Before and After should be same.")
 
-        # pred, conf 계산
-        array = run_cd(model, [dataset])
-        pred_array = np.array(array.pred_sem_seg.data.cpu())[0]
-        conf_array = np.array(torch.sigmoid(array.seg_logits.data.cpu()[1])) * 100
+    else:
+        os.makedirs(os.path.join(tile, "A"), exist_ok=True)
+        os.makedirs(os.path.join(tile, "B"), exist_ok=True)
+        for folder in [folder_1, folder_2]:
+            for file in before_li:
+                if folder == folder_1:
+                    retile(os.path.join(folder, file), os.path.join(tile, "A"), px)
+                else:
+                    retile(os.path.join(folder, file), os.path.join(tile, "B"), px)
 
-        output_tif_path = os.path.join(output, os.path.basename(dataset[0]))
-        output_tif_conf_path = os.path.join(output_conf, os.path.basename(dataset[0]))
+        # Tile 이미지 셋 리스트 생성
+        dataset_li = []
+        file_li = sorted(os.listdir(os.path.join(tile, "A")))
+        for file in file_li:
+            cd_set = [
+                os.path.join(os.path.join(tile, "A"), file),
+                os.path.join(os.path.join(tile, "B"), file),
+            ]
+            dataset_li.append(cd_set)
 
-        # 좌표 입히기
-        save_array_as_geotiff(pred_array, dataset[0], output_tif_path)
-        save_array_as_geotiff(conf_array, dataset[0], output_tif_conf_path)
+        # 이미지 셋트별로 변화탐지 추론실시(추론 -> 좌표넣기 -> 후처리)
+        for dataset in tqdm(dataset_li):
 
-        # 후처리
-        post_processed_tif_path = os.path.join(
-            post_processed, os.path.basename(dataset[0])
+            # pred, conf 계산
+            array = run_cd(model, [dataset])
+            pred_array = np.array(array.pred_sem_seg.data.cpu())[0]
+            conf_array = np.array(torch.sigmoid(array.seg_logits.data.cpu()[1])) * 100
+
+            output_tif_path = os.path.join(output, os.path.basename(dataset[0]))
+            output_tif_conf_path = os.path.join(
+                output_conf, os.path.basename(dataset[0])
+            )
+
+            # 좌표 입히기
+            save_array_as_geotiff(pred_array, dataset[0], output_tif_path)
+            save_array_as_geotiff(conf_array, dataset[0], output_tif_conf_path)
+
+            # 후처리
+            post_processed_tif_path = os.path.join(
+                post_processed, os.path.basename(dataset[0])
+            )
+            post_processing(output_tif_path, post_processed_tif_path)
+
+            # Vectorize
+            output_gpkg_path = os.path.join(
+                output_gpkg, os.path.basename(dataset[0]).replace(".tif", ".gpkg")
+            )
+            post_processed_gpkg_path = os.path.join(
+                post_processed_gpkg,
+                os.path.basename(dataset[0]).replace(".tif", ".gpkg"),
+            )
+            polygonize(output_tif_path, output_gpkg_path)
+            polygonize(post_processed_tif_path, post_processed_gpkg_path)
+
+        # 전체 추론결과 합치기
+        tif_merge(output_conf, os.path.join(root_path, "conf.tif"))
+        ogr_merge(output_gpkg, os.path.join(root_path, "merged.gpkg"))
+        # ogr_merge(post_processed_gpkg, os.path.join(root_path, "post_processed_merged.gpkg"))
+        ogr_merge(post_processed_gpkg, os.path.join(root_path, out_name))
+
+        # Confidence Score 구하기
+        conf_score(
+            os.path.join(root_path, "conf.tif"), os.path.join(root_path, out_name)
         )
-        post_processing(output_tif_path, post_processed_tif_path)
 
-        # Vectorize
-        output_gpkg_path = os.path.join(
-            output_gpkg, os.path.basename(dataset[0]).replace(".tif", ".gpkg")
-        )
-        post_processed_gpkg_path = os.path.join(
-            post_processed_gpkg, os.path.basename(dataset[0]).replace(".tif", ".gpkg")
-        )
-        polygonize(output_tif_path, output_gpkg_path)
-        polygonize(post_processed_tif_path, post_processed_gpkg_path)
+        # logging status: done
+        log["status"] = "done"
+        with open(log_path, "w") as logfile:
+            json.dump(log, logfile)
 
-    # 전체 추론결과 합치기
-    tif_merge(output_conf, os.path.join(root_path, "conf.tif"))
-    ogr_merge(output_gpkg, os.path.join(root_path, "merged.gpkg"))
-    # ogr_merge(post_processed_gpkg, os.path.join(root_path, "post_processed_merged.gpkg"))
-    ogr_merge(post_processed_gpkg, os.path.join(root_path, out_name))
+        # Remove tmp folders
+        for folder in new_folders:
+            shutil.rmtree(folder)
+        os.remove(os.path.join(root_path, "merged.gpkg"))
+        os.remove(os.path.join(root_path, "conf.tif"))
 
-    # Confidence Score 구하기
-    conf_score(os.path.join(root_path, "conf.tif"), os.path.join(root_path, out_name))
-
-    # logging status: done
-    log["status"] = "done"
-    with open(log_path, "w") as logfile:
-        json.dump(log, logfile)
-
-    # Remove tmp folders
-    for folder in new_folders:
-        shutil.rmtree(folder)
-    os.remove(os.path.join(root_path, "merged.gpkg"))
-    os.remove(os.path.join(root_path, "conf.tif"))
-
-    print(f"Total time elapsed: {time()-start}")
+        print(f"Total time elapsed: {time()-start}")

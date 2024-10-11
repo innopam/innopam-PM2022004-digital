@@ -10,7 +10,7 @@ export img_1=/workspace/sample_data/A img_2=/workspace/sample_data/B output_path
     - output_path: output(.gpkg) 저장 경로
 
 ## 2. 데이터 처리 과정
-1. 데이터 Tiling(추가예정)
+1. 데이터 Tiling
 2. 변화탐지 추론(.tif)
 3. 후처리(.tif)
 4. 결과 merge(.tif)
@@ -19,7 +19,7 @@ export img_1=/workspace/sample_data/A img_2=/workspace/sample_data/B output_path
 
 ## 3. input, output
 - input
-    - Before, After 두 시기의 항공영상(폴더)
+    - Before, After 두 시기의 도엽단위의 항공영상(폴더)
     - A, B 폴더의 파일은 동일한 이름의 파일끼리 한 쌍을 이룸
 - output
     - out.gpkg, out.json
@@ -48,12 +48,12 @@ export img_1=/workspace/sample_data/A img_2=/workspace/sample_data/B output_path
         - model: config(.py), 가중치(.pth)로 구성
         - sample_data: A(Before 이미지), B(After 이미지)로 구성
         - predict.py: 추론 + 후처리 코드
-            - 매개변수: default값 지정 되어있음
-                - --config: config(.py) 파일 경로
-                - --pth: 가중치(.pth) 파일 경로
-                - --img_1: A(Before 이미지) 폴더 경로
-                - --img_2: B(After 이미지) 폴더 경로
-                - --output_path: 결과물 생성파일 경로(.gpkg), 경로 없을시 폴더 생성함
+            - --img_1: A(Before 이미지) 폴더 경로
+            - --img_2: B(After 이미지) 폴더 경로
+            - --output_path: 결과물 생성파일 경로(.gpkg), 경로 없을시 폴더 생성함
+            - --config: config(.py) 파일 경로
+            - --pth: 가중치(.pth) 파일 경로
+            - --px: 이미지 추론시 retile 사이즈(pixel)
 
     - out: 결과물 생성 예시. container 내부의 /workspace가 아닌 다른 폴더로 지정 가능
 - docker-compose.yml
