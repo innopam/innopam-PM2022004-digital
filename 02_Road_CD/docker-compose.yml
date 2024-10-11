@@ -13,8 +13,6 @@ services:
     environment:
       PROJ_LIB: /opt/conda/share/proj
       GDAL_DATA: /opt/conda/share/gdal
-    # env_file:
-    #   - ./.env
     deploy:
       resources:
         reservations:

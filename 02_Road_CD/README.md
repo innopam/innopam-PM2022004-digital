@@ -1,7 +1,13 @@
 ## 1. 사용방법
 ```bash
-sh ./start.sh
+cd ./innopam-PM2022004-digital/02_Road_CD
+docker build -t opencd_pytorch:latest .
+export img_1=/workspace/sample_data/A img_2=/workspace/sample_data/B output_path=/workspace/out/out.gpkg && docker-compose up
 ```
+- docker-compose up 전, input, output 경로(container 내부 경로)를 환경변수로 지정해야 함
+    - img_1: input(Before 이미지) 폴더 경로
+    - img_2: input(After 이미지) 폴더 경로
+    - output_path: output(.gpkg) 저장 경로
 
 ## 2. 데이터 처리 과정
 1. 데이터 Tiling(추가예정)
@@ -25,7 +31,6 @@ sh ./start.sh
 ├── docker-compose.yml
 ├── dockerfile
 ├── READMD.md
-├── start.sh
 └── workspace
     ├── model
     │   ├── ban_vit-l14-georsclip_iter_8000.pth
