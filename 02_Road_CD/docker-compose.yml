@@ -21,4 +21,4 @@ services:
               count: all
               capabilities: [ gpu ]
     # command: sh -c "python /workspace/predict.py --output_path /workspace/out2/out.gpkg"
-    command: sh -c "python /workspace/predict.py --output_path ${output_path} --img_1 ${img_1} --img_2 ${img_2}"
+    command: sh -c "python /workspace/predict.py --output_file_path ${output_file_path} --before_img_dir_path ${before_img_dir_path} --after_img_dir_path ${after_img_dir_path}"

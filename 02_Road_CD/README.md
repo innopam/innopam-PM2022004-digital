@@ -2,12 +2,13 @@
 ```bash
 cd ./innopam-PM2022004-digital/02_Road_CD
 docker build -t opencd_pytorch:latest .
-export img_1=/workspace/sample_data/A img_2=/workspace/sample_data/B output_path=/workspace/out/out.gpkg && docker-compose up
+export before_img_dir_path=/workspace/sample_data/A after_img_dir_path=/workspace/sample_data/B output_file_path=/workspace/out/out.gpkg \
+&& docker-compose up
 ```
 - docker-compose up 전, input, output 경로(container 내부 경로)를 환경변수로 지정해야 함
-    - img_1: input(Before 이미지) 폴더 경로
-    - img_2: input(After 이미지) 폴더 경로
-    - output_path: output(.gpkg) 저장 경로
+    - before_img_dir_path: input(Before 이미지) 폴더 경로
+    - after_img_dir_path: input(After 이미지) 폴더 경로
+    - output_file_path: output(.gpkg) 저장 경로
 
 ## 2. 데이터 처리 과정
 1. 데이터 Tiling
@@ -58,9 +59,9 @@ export img_1=/workspace/sample_data/A img_2=/workspace/sample_data/B output_path
         - model: config(.py), 가중치(.pth)로 구성
         - sample_data: A(Before 이미지), B(After 이미지)로 구성
         - predict.py: 추론 + 후처리 코드
-            - --img_1: A(Before 이미지) 폴더 경로
-            - --img_2: B(After 이미지) 폴더 경로
-            - --output_path: 결과물 생성파일 경로(.gpkg), 경로 없을시 폴더 생성함
+            - --before_img_dir_path: A(Before 이미지) 폴더 경로
+            - --after_img_dir_path: B(After 이미지) 폴더 경로
+            - --output_file_path: 결과물 생성파일 경로(.gpkg), 경로 없을시 폴더 생성함
             - --config: config(.py) 파일 경로
             - --pth: 가중치(.pth) 파일 경로
             - --px: 이미지 추론시 retile 사이즈(pixel)

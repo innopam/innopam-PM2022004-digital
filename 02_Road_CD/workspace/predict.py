@@ -31,15 +31,21 @@ from opencd.apis import OpenCDInferencer
 
 def make_args():
     """
-    img_1(.tif): Before 이미지(도엽별 항공영상)가 담긴 폴더 경로
-    img_2(.tif): After 이미지(도엽별 항공영상)가 담긴 폴더 경로
-    output_path(.gpkg): 최종 결과물 경로
+    before_img_dir_path(.tif): Before 이미지(도엽별 항공영상)가 담긴 폴더 경로
+    after_img_dir_path(.tif): After 이미지(도엽별 항공영상)가 담긴 폴더 경로
+    output_file_path(.gpkg): 최종 결과물 경로
     """
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--img_1", type=str, default="/workspace/sample_data/A")
-    parser.add_argument("--img_2", type=str, default="/workspace/sample_data/B")
-    parser.add_argument("--output_path", type=str, default="/workspace/out/out.gpkg")
+    parser.add_argument(
+        "--before_img_dir_path", type=str, default="/workspace/sample_data/A"
+    )
+    parser.add_argument(
+        "--after_img_dir_path", type=str, default="/workspace/sample_data/B"
+    )
+    parser.add_argument(
+        "--output_file_path", type=str, default="/workspace/out/out.gpkg"
+    )
 
     parser.add_argument(
         "--config", type=str, default="/workspace/model/ban_vit-l14-georsclip.py"
@@ -176,11 +182,11 @@ if __name__ == "__main__":
     args = make_args().parse_args()
     config = args.config
     pth = args.pth
-    folder_1 = args.img_1
-    folder_2 = args.img_2
+    folder_1 = args.before_img_dir_path
+    folder_2 = args.after_img_dir_path
     px = args.px
-    root_path = os.path.dirname(args.output_path)
-    out_name = os.path.basename(args.output_path)
+    root_path = os.path.dirname(args.output_file_path)
+    out_name = os.path.basename(args.output_file_path)
 
     # 결과물, 중간산출물 폴더 생성
     output = os.path.join(root_path, "output")
