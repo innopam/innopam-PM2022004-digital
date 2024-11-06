@@ -1,0 +1,20 @@
+# install pytorch 2.4.1
+FROM pytorch/pytorch:2.4.1-cuda12.1-cudnn9-devel
+
+# Install Python packages
+RUN apt update && apt-get update
+RUN apt-get update --fix-missing
+RUN pip install --upgrade pip
+RUN printf "6\n69" | apt install -y software-properties-common
+RUN apt install -y git build-essential geotiff-bin libgdal-dev gdal-bin
+
+# Install MambaCD
+RUN apt install -y git
+WORKDIR /root
+RUN git clone https://github.com/innopam/MambaCD.git
+WORKDIR ./MambaCD
+RUN pip install -r requirements.txt
+RUN pip install -e ./kernels/selective_scan
+
+# Set Path
+ENV PYTHONPATH="/root"
