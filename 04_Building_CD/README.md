@@ -36,7 +36,7 @@ export dataset_path=/workspace/sample_data output_path=/workspace/out model_path
     │   ├── T2
     └── out
         ├── status.json
-        ├── tiles
+        ├── patches
 		├──377052100
 			├──T1
 			├──T2
@@ -59,13 +59,10 @@ export dataset_path=/workspace/sample_data output_path=/workspace/out model_path
 		- model: config(.yaml), 가중치(.pth)로 구성
 		- sample_data: T1(Before 이미지), T2(After 이미지)로 구성
 		- predict.py: 추론코드
-			- --cfg: config 파일 경로
-			- --dataset: 데이터셋 이름
-			- --init_dataset_path: Before/After 영상 경로
-			- --infer_dataset_path: AI데이터 저장 경로
-			- --result_saved_path: 결과물 저장 경로
-			- -- resume: 가중치 파일 경로
-			- -- patch_size: AI데이터 패치 크기
-			- -- overlap_ratio: 패치 영상 중복도 (default='min')
+   			- --model_path: 가중치/모델 파일 경로
+			- --dataset_path: Before/After 영상 경로
+			- --output_path: 결과물 저장 경로
+			- --patch_size: AI데이터 패치 크기
+			- --overlap_ratio: 패치 영상 중복도 (default='min')
 		- out: container 내부의 /workspace가 아닌 다른 폴더로 지정 가능
 
