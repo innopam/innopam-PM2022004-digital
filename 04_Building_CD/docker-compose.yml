@@ -1,15 +1,14 @@
-version: '3.9'
-
 services:
   mambacd:
     image: building_cd:latest
     volumes:
       - ./workspace:/workspace
-      # - [host]:[container]
-      # build:
-      #   dockerfile: ./dockerfile
-      #   shm_size: '30gb'
-    shm_size: '30gb'
+    shm_size: '50gb'
+    tty: true
+    stdin_open: true
+    environment:
+      - PYTHONUNBUFFERED=1
+      - FORCE_COLOR=1
     deploy:
       resources:
         reservations:
