@@ -1,7 +1,10 @@
-
 # 사용방법
 ```
 cd ./innopam-PM2022004-digital/02_Road_CD
+
+# 모델 다운로드
+curl -u $USER:$PASSWORD -o ./workspace/model/model.pth https://nexus.innopam.kr/repository/models-repo/digital_land/02_Road_CD/model.pth
+
 docker build --tag road_cd:1.0 .
 export dataset_path=/workspace/input output_path=/workspace/output
 docker-compose up
