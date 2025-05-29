@@ -1,0 +1,14 @@
+{
+    "Total_step": 1,
+    "Current_step": 1,
+    "Process": 100,
+    "Status": "done",
+    "ElapsedTime": {
+        "패치 생성": "1.05s",
+        "추론": "18.15s",
+        "재구성": "0.27s",
+        "벡터화": "0.77s"
+    },
+    "final_name": "367011758",
+    "CurrentTask": "process completed"
+}

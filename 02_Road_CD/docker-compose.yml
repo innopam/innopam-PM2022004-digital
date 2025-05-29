@@ -1,18 +1,14 @@
-version: '3.9'
-
 services:
-  opencd:
-    image: opencd_pytorch:latest
+  mambacd:
+    image: road_cd:1.0
     volumes:
       - ./workspace:/workspace
-      # - [host]:[container]
-      # build:
-      #   dockerfile: ./dockerfile
-      #   shm_size: '30gb'
-    shm_size: '30gb'
+    shm_size: '50gb'
+    tty: true
+    stdin_open: true
     environment:
-      PROJ_LIB: /opt/conda/share/proj
-      GDAL_DATA: /opt/conda/share/gdal
+      - PYTHONUNBUFFERED=1
+      - FORCE_COLOR=1
     deploy:
       resources:
         reservations:
@@ -20,5 +16,4 @@ services:
             - driver: nvidia
               count: all
               capabilities: [ gpu ]
-    # command: sh -c "python /workspace/predict.py --output_path /workspace/out2/out.gpkg"
-    command: sh -c "python /workspace/predict.py --output_file_path ${output_file_path} --before_img_dir_path ${before_img_dir_path} --after_img_dir_path ${after_img_dir_path}"
+    command: sh -c "python /workspace/predict.py --dataset_path ${dataset_path} --output_path ${output_path}"
