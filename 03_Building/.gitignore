@@ -15,7 +15,4 @@ Thumbs.db
 
 *.pyc
 
-workspace/input/
-workspace/model/
-
 *.tar
