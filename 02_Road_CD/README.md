@@ -3,10 +3,19 @@
 cd ./innopam-PM2022004-digital/02_Road_CD
 
 # 모델 다운로드
-curl -u $USER:$PASSWORD -o ./workspace/model/model.pth https://nexus.innopam.kr/repository/models-repo/digital_land/02_Road_CD/model.pth
+curl -u $USER:$PASSWORD -o ./workspace/model/model.pth https://nexus.innopam.kr/repository/models-repo/digital_land/02_Road_CD/model/model.pth
 
+# 샘플 이미지 다운로드: T1, T2
+curl -u $USER:$PASSWORD -o ./workspace/input/T1/367011758.tif https://nexus.innopam.kr/repository/models-repo/digital_land/02_Road_CD/input/T1/367011758.tif
+curl -u $USER:$PASSWORD -o ./workspace/input/T2/367011758.tif https://nexus.innopam.kr/repository/models-repo/digital_land/02_Road_CD/input/T2/367011758.tif
+
+# Docker image 생성
 docker build --tag road_cd:1.0 .
+
+# input, output 경로 지정
 export dataset_path=/workspace/input output_path=/workspace/output
+
+# 추론 실행
 docker-compose up
 ```
 
