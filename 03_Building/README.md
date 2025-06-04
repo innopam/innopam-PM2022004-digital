@@ -3,7 +3,12 @@
 ### 사용 방법
 
 ```bash
-export dataset_path=/workspace/input output_path=/workspace/out model_path=/workspace/model && docker compose run dt
+cd ./innopam-PM202204-digital/03_Building
+docker build -t dt:latest .
+# 디버그
+export dataset_path=/workspace/input output_path=/workspace/output model_path=/workspace/model && docker compose run dt
+# 실행
+export dataset_path=/workspace/input output_path=/workspace/output model_path=/workspace/model && docker compose up
 ```
 ---
 
