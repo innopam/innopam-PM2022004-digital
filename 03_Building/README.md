@@ -3,7 +3,8 @@
 ### 사용 방법
 
 ```bash
-export dataset_path=/workspace/input output_path=/workspace/out model_path=/workspace/model && docker compose run dt```
+export dataset_path=/workspace/input output_path=/workspace/out model_path=/workspace/model && docker compose run dt
+```
 ---
 
 ### 데이터 처리 과정
