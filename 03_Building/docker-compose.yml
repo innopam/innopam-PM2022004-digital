@@ -2,7 +2,7 @@ version: '3.9'
 
 services:
   dt:
-    image: dt:latest
+    image: building:latest
     volumes:
       - ./workspace:/workspace
     shm_size: '50gb'
@@ -18,5 +18,5 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
-    command: sh -c "python /workspace/main.py --input ${dataset_path} --output ${output_path} --model ${model_path}"
+    command: sh -c "python3 /workspace/main.py --input ${dataset_path} --output ${output_path} --model ${model_path}"
 
