@@ -9,6 +9,7 @@ jinja2
 tqdm
 pillow
 python-multipart
-onnxruntime
+onnxruntime-gpu==1.17.1
 opencv-python
+more-itertools
 

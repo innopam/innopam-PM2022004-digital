@@ -37,8 +37,7 @@ export dataset_path=/workspace/input output_path=/workspace/output model_path=/w
 - `input/T1`, `input/T2` 폴더에 각각 저장
 
 ### Output
-- `output/cur_result.geojson`: 현재 시점 건물 추론 결과
-- `output/prev_result.geojson`: 과거 시점 건물 추론 결과
+- `output/result.json`: 변화 탐지 결과
 - `output/status.json`: 전체 파이프라인 진행도 상태
 ---
 
@@ -51,8 +50,7 @@ workspace/
 ├── model/
 │   └── building_2005_deepness.onnx
 ├── output/
-│   └── cur_result.goejson
-│   └── prev_result.geojson
+│   └── result.json
 │   └── status.json
 └── main.py
 ```
@@ -73,6 +71,7 @@ parser.add_argument("-o", "--output", type=str, default="workspace/output", help
 parser.add_argument("-c", "--conf-threshold", type=float, default=None)
 parser.add_argument("-r", "--resolution", type=float, default=None)
 parser.add_argument("--classes", type=str, default=None)
+parser.add_argument("-b", "--batch-size", type=int, default=8)
 parser.add_argument("-t", "--max-threads", type=int, default=None)
 
 parser.add_argument("--cut-threshold", type=float, default=0.05)

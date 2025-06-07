@@ -13,6 +13,8 @@ import networkx as nx
 import pandas as pd
 import time
 
+from more_itertools import chunked
+from multiprocessing import Pool
 from shapely.ops import unary_union
 from rasterio.windows import Window
 from shapely.geometry import shape
@@ -34,6 +36,7 @@ def make_args():
     parser.add_argument("-r", "--resolution", type=float, default=None)
     parser.add_argument("--classes", type=str, default=None)
     parser.add_argument("-t", "--max-threads", type=int, default=None)
+    parser.add_argument("-b", "--batch-size", type=int, default=8)
 
     parser.add_argument("--cut-threshold", type=float, default=0.05)
     parser.add_argument("--cd-threshold", type=float, default=0.7)
@@ -167,6 +170,7 @@ def create_session(model_file, max_threads=None):
     # ONNX 모델 로드 및 config 생성
     options = ort.SessionOptions()
     options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    options.log_severity_level = 3
     if max_threads is not None:
         options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
         options.intra_op_num_threads = max_threads
@@ -322,40 +326,71 @@ def determine_indexes(raster):
 
 
 # 4) 추론, 타일 마스크 생성 및 병합
-def process_tiles(raster, windows, indexes, session, config, progress: ProgressBar, total_perc):
-    # 모델 추론 수행, 타일 마스크 생성
-    height, width = raster.shape
-    model_res = config['resolution']
-    input_res = round(max(abs(raster.transform[0]), abs(raster.transform[4])), 4) * 100
-    scale_factor = max(1, int(model_res // input_res)) if input_res < model_res else 1
-    tiles_overlap = config['tiles_overlap'] / 100.0
-    mask = np.zeros((height // scale_factor, width // scale_factor), dtype=np.uint8)
-
-    per_tile_perc = total_perc / len(windows)
-
-    for idx, w in enumerate(windows):
-        progress.update(f"Processing tile {idx+1}/{len(windows)}", perc=per_tile_perc)
-
-        img = raster.read(
+def read_tile(args):
+    # 타일 생성
+    raster_path, window, indexes, config = args
+    with rasterio.open(raster_path) as src:
+        img = src.read(
             indexes=indexes,
-            window=w,
+            window=window,
             boundless=True,
             fill_value=0,
             out_shape=(len(indexes), config['tiles_size'], config['tiles_size']),
             resampling=rasterio.enums.Resampling.bilinear
         )
-        tile_mask = execute_segmentation(img, session, config)
-        merge_mask(tile_mask, mask, w, width, height, tiles_overlap, scale_factor)
+    return img
 
+
+def preprocess_batch(image_list):
+    # 배치 만들기
+    stacked = np.stack(image_list, axis=0)  # (N, C, H, W) 또는 (N, H, W, C)
+    return preprocess(stacked)
+
+
+def execute_batch_segmentation(images_batch, session, config):
+    images_batch = preprocess_batch(images_batch)
+    outs = session.run(None, {config['input_name']: images_batch})
+    final_out = outs[0][:, 0, :, :]
+    return [final_out[i] for i in range(final_out.shape[0])]
+
+
+def process_tiles(raster_path, windows, indexes, session, config, progress: ProgressBar, total_perc, batch_size):
+    n = len(windows)
+    read_perc = total_perc * 0.15
+    infer_perc = total_perc * 0.75
+    merge_perc = total_perc * 0.1
+    per_tile_merge_perc = merge_perc / n
+
+    # 타일 병렬 생성
+    progress.update("Reading tiles", read_perc)
+    args_list = [(raster_path, w, indexes, config) for w in windows]
+    with Pool() as pool:
+        tile_images = pool.map(read_tile, args_list)
+    progress.write("Completed tile reading")
+
+    # 추론
+    tile_masks = []
+    total_batches = len(tile_images) // batch_size + int(len(tile_images) % batch_size != 0)
+    per_batch_perc = infer_perc / total_batches
+
+    for i, batch in enumerate(chunked(tile_images, batch_size)):
+        progress.update(f"Inference batch {i+1}/{total_batches}", perc=per_batch_perc)
+        batch_masks = execute_batch_segmentation(batch, session, config)  # List[(H, W)]
+        tile_masks.extend(batch_masks)
+    progress.write(f"Completed inference")
+
+    with rasterio.open(raster_path) as src:
+        height, width = src.shape
+        input_res = round(max(abs(src.transform[0]), abs(src.transform[4])), 4) * 100
+    model_res = config['resolution']
+    scale_factor = max(1, int(model_res // input_res)) if input_res < model_res else 1
+    tiles_overlap = config['tiles_overlap'] / 100.0
+    mask = np.zeros((height // scale_factor, width // scale_factor), dtype=np.uint8)
+
+    for idx, w in enumerate(windows):
+        progress.update(f"Merging tile {idx+1}/{n}", perc=per_tile_merge_perc)
+        merge_mask(tile_masks[idx], mask, w, width, height, tiles_overlap, scale_factor)
     return mask
-
-
-def execute_segmentation(images, session, config):
-    images = preprocess(images)
-    outs = session.run(None, {config['input_name']: images})
-    out = outs[0]
-    building_conf = out[0, 0, :, :]
-    return building_conf
 
 
 def preprocess(model_input):
@@ -981,7 +1016,24 @@ def cd_pipeline(dmap, seg, cd_threshold):
     seg = assign_class(seg, cd_threshold)
     dmap = dmap.rename(columns={"Relation": "rel_cd"})
     seg = seg.rename(columns={"Relation": "rel_cd"})
-    return dmap, seg
+    result = pd.concat([dmap, seg[seg['cd_class'] == '신축']],
+                       ignore_index=True)
+    cd_class_map = {'변화없음': 0, '신축': 1, '소멸': 2, '갱신': 3}
+
+    result = result.copy()
+    result['CLS_NAME'] = result['cd_class']
+    result['CLS_ID'] = result['CLS_NAME'].map(cd_class_map)
+    result['AREA'] = result['geometry'].area.round(2)
+
+    # 필요한 컬럼만 남기기
+    result['ID'] = result.apply(
+        lambda row: f"p_{int(row['poly1_idx'])}" if not pd.isna(row.get('poly1_idx')) else f"c_{int(row['poly2_idx'])}",
+        axis=1
+    )
+
+    # 필요한 컬럼만 정리
+    result = result[['CLS_ID', 'CLS_NAME', 'AREA', 'ID', 'geometry']]
+    return result
 
 
 def main():
@@ -1003,12 +1055,12 @@ def main():
             resolution=args.resolution,
             classes=args.classes
         )
-        progress.write("Complete Load Model")
+        progress.write("Completed Load Model")
     # 영상 데이터, 해상도 설정
     with status.task("Loading GeoTIFF"):
         progress.update("Loading GeoTIFF", perc=5)
         raster = load_raster(args.geotiff)
-        progress.write("Complete Load GeoTIFF")
+        progress.write("Completed Load GeoTIFF")
 
     with raster:
         input_res = get_input_resolution(raster)
@@ -1016,8 +1068,8 @@ def main():
         indexes = determine_indexes(raster)
 
         with status.task("Processing Tiles"):
-            mask = process_tiles(raster, windows, indexes, session, config, progress=progress, total_perc=55)
-            progress.write("Complete Process tiles")
+            mask = process_tiles(args.geotiff, windows, indexes, session, config, progress=progress, total_perc=55, batch_size=args.batch_size)
+            progress.write("Completed Process tiles")
 
     with status.task("PostProcessing"):
         progress.update("PostProcessing", perc=5)
@@ -1032,7 +1084,7 @@ def main():
         inf_gdf = simplify_polygon(inf_gdf, tolerance=0.4, preserve_topology=True)
         inf_gdf = gpd.GeoDataFrame(geometry=inf_gdf)
 
-        progress.write("Complete PostProcessing")
+        progress.write("Completed PostProcessing")
     # 변화 탐지 시작
     with status.task("Generating Graph"):
         progress.write("Start Change Detection")
@@ -1046,7 +1098,7 @@ def main():
         graph = build_graph(joined)
         graph = add_energy_to_links(prev_gdf, inf_gdf, graph)
         component, graph, cut_link, summary = split_graph_by_energy(prev_gdf, inf_gdf, graph, args.cut_threshold)
-        progress.write("Complete Generating Graph")
+        progress.write("Completed Generating Graph")
 
     with status.task("Cal metrics"):
         # metrics 계산
@@ -1054,17 +1106,13 @@ def main():
         prev_gdf, inf_gdf = mark_cut_links(prev_gdf, inf_gdf, cut_link)
         prev_gdf, inf_gdf = attach_metrics_from_components(component, prev_gdf, inf_gdf)
 
-        progress.write("Complete Cal metrics")
+        progress.write("Completed Cal metrics")
     with status.task("Classification"):
-        progress.update("Finalizing", perc=5)
+        progress.update("Finalizing", perc=6)
         # 변화 유형 분류
-        prev_path = os.path.join(args.output, "prev_result.geojson")
-        cur_path = os.path.join(args.output, "cur_result.geojson")
-
-        if not (os.path.exists(prev_path) and os.path.exists(cur_path)):
-            prev_result, cur_result = cd_pipeline(prev_gdf, inf_gdf, args.cd_threshold)
-            prev_result.to_file(prev_path, driver="GeoJSON")
-            cur_result.to_file(cur_path, driver="GeoJSON")
+        result = cd_pipeline(prev_gdf, inf_gdf, args.cd_threshold)
+        os.makedirs(args.output, exist_ok=True)
+        result.to_file(os.path.join(args.output, "result.json"), driver="GeoJSON", encoding="euc-kr")
     with status.task("Done"):
         progress.write("Done")
 
