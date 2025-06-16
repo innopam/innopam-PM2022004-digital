@@ -14,7 +14,7 @@ from skimage.measure import label
 from shapely.ops import unary_union
 from shapely.geometry import Polygon, shape, mapping
 
-from MambaCD.changedetection.apis import Inferencer
+from MambaCD.changedetection.apis import Inferencer2
 
 # Ray 초기화 (필요하다면 수정)
 ray.shutdown()
@@ -218,7 +218,7 @@ def make_patch(t1_path, t2_path, save_dir, patch_size, img_name, overlap_ratio):
 @measure_time
 def inference(args, mode, img_name):
     # 모델 로직 건드리지 않음
-    inf= Inferencer(args, mode, img_name)
+    inf= Inferencer2(args, mode, img_name)
     inf.infer()
     return "추론 완료"
 
@@ -677,6 +677,8 @@ def step_vectorize(args):
 def main():
     # 1) 인자 생성
     args = make_args().parse_args()
+    
+    args.model_weights = [os.path.join(args.model_path, pth) for pth in os.listdir(args.model_path) if pth.endswith('.pth')][0]
 
     # make patch
     init_infer_path = os.path.join(args.output_path,'patches')
@@ -688,7 +690,7 @@ def main():
     t1_list = [file for file in os.listdir(init_t1_path) if file.endswith(".tif")]
     t2_list = [file for file in os.listdir(init_t2_path) if file.endswith(".tif")]
 
-    if t1_list != t2_list:
+    if len(t1_list) != len(t2_list):
         raise(RuntimeError("=> Please match before/after images"))
 
     if not os.path.exists(args.output_path):
@@ -707,10 +709,9 @@ def main():
         }, f, indent=4)
 
     try:
-        for t in t1_list:
-            t1_file = t
-            t2_file = t
-
+        for t1, t2 in zip(t1_list, t2_list):
+            t1_file = t1
+            t2_file = t2
             # (2) final_name 생성
             base_t1 = t1_file.replace(".tif","")
             base_t2 = t2_file.replace(".tif","")
@@ -726,6 +727,7 @@ def main():
             with open(status_file,"r") as ff:
                 st= json.load(ff)
             st["Status"] = 'in progress'
+            st["final_name"]= final_name
             with open(status_file,"w") as ff:
                 json.dump(st,ff,indent=4)
 
