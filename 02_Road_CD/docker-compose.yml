@@ -1,5 +1,5 @@
 services:
-  mambacd:
+  roadcd:
     image: road_cd:1.0
     volumes:
       - ./workspace:/workspace
