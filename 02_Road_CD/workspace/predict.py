@@ -40,7 +40,6 @@ from infer_real_ortho import (  # noqa: E402
     PairInfo,
     build_tile_specs,
     preprocess_tiles,
-    read_tile,
     repair_geometry,
     resolve_clip_window,
     trim_tile,
@@ -213,6 +212,85 @@ def build_output_profile(t1_path: Path, clip_window):
     return profile
 
 
+PERCENTILE_LOW = 2.0
+PERCENTILE_HIGH = 98.0
+SAMPLE_SIZE_FOR_SCALE = 2048
+
+
+def compute_band_scale(band_sample: np.ndarray, dtype_str: str) -> tuple:
+    """샘플 영역에서 per-band (lo, hi) 컷오프 값 계산.
+    - uint8: (0, 255) identity (smoke test 동작 유지)
+    - 그 외 (uint16/int16/float 등): nonzero 픽셀의 2~98 percentile
+      (no-data/검은 padding 영향 배제, outlier 둔감화)
+    """
+    if dtype_str == "uint8":
+        return (0.0, 255.0)
+    arr = band_sample.astype(np.float32)
+    nonzero = arr[arr > 0]
+    if nonzero.size == 0:
+        return (0.0, 1.0)
+    lo = float(np.percentile(nonzero, PERCENTILE_LOW))
+    hi = float(np.percentile(nonzero, PERCENTILE_HIGH))
+    if hi <= lo:
+        return (lo, lo + 1.0)
+    return (lo, hi)
+
+
+def compute_image_scales(src) -> list:
+    """이미지 중앙에서 sample 영역을 읽어 per-band (lo, hi) 컷오프 계산.
+    Tile 별이 아니라 image 전체에 동일한 스케일 적용 → 타일 경계 일관성 보장.
+    """
+    sw = min(SAMPLE_SIZE_FOR_SCALE, src.width)
+    sh = min(SAMPLE_SIZE_FOR_SCALE, src.height)
+    cx = max(0, (src.width - sw) // 2)
+    cy = max(0, (src.height - sh) // 2)
+    sample = src.read(indexes=(1, 2, 3), window=Window(cx, cy, sw, sh))
+    return [compute_band_scale(sample[i], src.dtypes[i]) for i in range(3)]
+
+
+def apply_band_scale(band_arr: np.ndarray, scale: tuple, dtype_str: str) -> np.ndarray:
+    """주어진 (lo, hi) 로 0~255 uint8 변환. uint8 은 그대로."""
+    if dtype_str == "uint8":
+        return band_arr.astype(np.uint8, copy=False)
+    lo, hi = scale
+    arr = band_arr.astype(np.float32)
+    clipped = np.clip(arr, lo, hi)
+    scaled = (clipped - lo) * (255.0 / (hi - lo))
+    return np.clip(scaled, 0, 255).astype(np.uint8)
+
+
+def read_tile_dtype_safe(src1, src2, clip_x: int, clip_y: int, spec,
+                         scales1: list, scales2: list) -> tuple:
+    """read_tile 대체 — image-level percentile 스케일 적용 + valid 항상 all-true."""
+    read_window = Window(clip_x + spec.read_x, clip_y + spec.read_y,
+                         spec.read_width, spec.read_height)
+    raw1 = src1.read(indexes=(1, 2, 3), window=read_window)
+    raw2 = src2.read(indexes=(1, 2, 3), window=read_window)
+    t1_bands = [apply_band_scale(raw1[i], scales1[i], src1.dtypes[i]) for i in range(3)]
+    t2_bands = [apply_band_scale(raw2[i], scales2[i], src2.dtypes[i]) for i in range(3)]
+    t1 = np.moveaxis(np.stack(t1_bands, axis=0), 0, -1)
+    t2 = np.moveaxis(np.stack(t2_bands, axis=0), 0, -1)
+    valid = np.ones((spec.read_height, spec.read_width), dtype=bool)
+    return t1, t2, valid
+
+
+def log_input_properties(t1_path: Path, t2_path: Path) -> None:
+    """진단용: 입력 이미지 dtype/사이즈/샘플 값 로그."""
+    for label, path in (("T1", t1_path), ("T2", t2_path)):
+        with rasterio.open(str(path), IGNORE_COG_LAYOUT_BREAK="YES") as src:
+            sw = min(500, src.width)
+            sh = min(500, src.height)
+            sample = src.read(1, window=Window(0, 0, sw, sh))
+            print(
+                f"[input] {label} {path.name}: "
+                f"size={src.width}x{src.height}, bands={src.count}, "
+                f"dtypes={src.dtypes}, "
+                f"band1 sample min/max/mean="
+                f"{int(sample.min())}/{int(sample.max())}/{float(sample.mean()):.1f}",
+                flush=True,
+            )
+
+
 def validate_pair_relaxed(t1_path: Path, t2_path: Path) -> PairInfo:
     """size/band/CRS 일치만 강제. transform 은 검사하지 않음 (기존 02_Road_CD 와 동일).
 
@@ -244,6 +322,7 @@ def validate_pair_relaxed(t1_path: Path, t2_path: Path) -> PairInfo:
 @measure_time
 def step_patch(t1_path: Path, t2_path: Path, patch_size: int, overlap_px: int):
     """패치 윈도우 명세 생성 (실제 파일은 자르지 않고 좌표만 계산)."""
+    log_input_properties(t1_path, t2_path)
     pair_info = validate_pair_relaxed(t1_path, t2_path)
     clip_window = resolve_clip_window(pair_info, None)
     clip_x, clip_y, clip_w, clip_h = clip_window
@@ -284,14 +363,25 @@ def step_inference(
          rasterio.open(str(conf_path), "w", BIGTIFF="YES", **profile) as conf_dst, \
          rasterio.open(str(valid_path), "w", BIGTIFF="YES", **profile) as valid_dst:
 
+        # image-level per-band 스케일 1번만 계산 → 모든 타일에 동일 적용 (uint8 은 identity).
+        scales1 = compute_image_scales(src1)
+        scales2 = compute_image_scales(src2)
+        print(
+            f"[normalize] {final_name}: T1 dtypes={src1.dtypes} scales={scales1}, "
+            f"T2 dtypes={src2.dtypes} scales={scales2}",
+            flush=True,
+        )
+
         pbar = tqdm(total=len(specs), desc=f"Inferring {final_name}")
         for start in range(0, len(specs), batch_size):
             batch_specs = list(specs[start:start + batch_size])
             t1_tiles, t2_tiles, valid_tiles = [], [], []
             for spec in batch_specs:
-                t1, t2, _ = read_tile(src1, src2, clip_x, clip_y, spec)
-                # band 4 무시: 항상 all-true
-                v = np.ones((spec.read_height, spec.read_width), dtype=bool)
+                # urban_cd_v1.read_tile 의 단순 uint8 캐스팅 회피용 wrapper.
+                # image-level percentile 스케일 + band 4 valid_mask 무시.
+                t1, t2, v = read_tile_dtype_safe(
+                    src1, src2, clip_x, clip_y, spec, scales1, scales2
+                )
                 t1_tiles.append(t1)
                 t2_tiles.append(t2)
                 valid_tiles.append(v)
