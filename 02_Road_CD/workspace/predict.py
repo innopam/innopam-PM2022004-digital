@@ -9,12 +9,12 @@
 내부 추론 엔진은 ChangeMamba → DINOv3 ViT-L/16 + UPerNet (Phase 3 class-2) 으로 교체.
 클래스: 1 = 신설/확장, 2 = 철거/축소.
 """
-import os
-import sys
-import json
-import time
 import argparse
+import json
+import os
 import subprocess
+import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -37,13 +37,13 @@ for path in (
         sys.path.insert(0, path)
 
 from infer_real_ortho import (  # noqa: E402
+    PairInfo,
     build_tile_specs,
     preprocess_tiles,
     read_tile,
     repair_geometry,
     resolve_clip_window,
     trim_tile,
-    validate_pair,
 )
 from postprocess_road_display_v2 import (  # noqa: E402
     component_mask_from_geometry,
@@ -213,10 +213,38 @@ def build_output_profile(t1_path: Path, clip_window):
     return profile
 
 
+def validate_pair_relaxed(t1_path: Path, t2_path: Path) -> PairInfo:
+    """size/band/CRS 일치만 강제. transform 은 검사하지 않음 (기존 02_Road_CD 와 동일).
+
+    실제 정사보정 산출물은 픽셀 크기와 origin 이 부동소수 노이즈 수준으로 다를 수 있어
+    urban_cd_v1 의 strict equality 체크는 너무 엄격함.
+    """
+    with rasterio.open(t1_path, IGNORE_COG_LAYOUT_BREAK="YES") as src1, \
+         rasterio.open(t2_path, IGNORE_COG_LAYOUT_BREAK="YES") as src2:
+        for attr in ("width", "height", "count", "crs"):
+            if getattr(src1, attr) != getattr(src2, attr):
+                raise ValueError(f"Raster mismatch for {attr}: "
+                                 f"{getattr(src1, attr)} != {getattr(src2, attr)}")
+        if src1.count < 3 or src2.count < 3:
+            raise ValueError("Both rasters must contain at least 3 bands")
+
+        return PairInfo(
+            t1_path=str(t1_path),
+            t2_path=str(t2_path),
+            width=src1.width,
+            height=src1.height,
+            count=src1.count,
+            crs=src1.crs.to_string() if src1.crs else None,
+            res_x=float(src1.res[0]),
+            res_y=float(src1.res[1]),
+            pixel_area=float(abs(src1.transform.a * src1.transform.e)),
+        )
+
+
 @measure_time
 def step_patch(t1_path: Path, t2_path: Path, patch_size: int, overlap_px: int):
     """패치 윈도우 명세 생성 (실제 파일은 자르지 않고 좌표만 계산)."""
-    pair_info = validate_pair(t1_path, t2_path)
+    pair_info = validate_pair_relaxed(t1_path, t2_path)
     clip_window = resolve_clip_window(pair_info, None)
     clip_x, clip_y, clip_w, clip_h = clip_window
     specs = build_tile_specs(clip_w, clip_h, patch_size, overlap_px)
@@ -241,6 +269,15 @@ def step_inference(
     autocast_enabled = device.type == "cuda"
     autocast_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
 
+    # band 4 (alpha/NIR)를 valid mask로 쓰지 않고 전부 유효 처리.
+    # urban_cd_v1 의 read_tile 은 4밴드 입력 시 band4>0 만 유효로 보지만,
+    # 운영 입력의 band 4가 alpha 의미가 아니거나 0인 경우 추론 결과가 다 무효 처리됨.
+    # 기존 02_Road_CD 동작과 맞추기 위해 항상 all-true.
+    total_pixels = 0
+    pred_pixels_class1 = 0
+    pred_pixels_class2 = 0
+    max_conf_seen = 0.0
+
     with rasterio.open(str(t1_path), IGNORE_COG_LAYOUT_BREAK="YES") as src1, \
          rasterio.open(str(t2_path), IGNORE_COG_LAYOUT_BREAK="YES") as src2, \
          rasterio.open(str(mask_path), "w", BIGTIFF="YES", **profile) as mask_dst, \
@@ -252,7 +289,9 @@ def step_inference(
             batch_specs = list(specs[start:start + batch_size])
             t1_tiles, t2_tiles, valid_tiles = [], [], []
             for spec in batch_specs:
-                t1, t2, v = read_tile(src1, src2, clip_x, clip_y, spec)
+                t1, t2, _ = read_tile(src1, src2, clip_x, clip_y, spec)
+                # band 4 무시: 항상 all-true
+                v = np.ones((spec.read_height, spec.read_width), dtype=bool)
                 t1_tiles.append(t1)
                 t2_tiles.append(t2)
                 valid_tiles.append(v)
@@ -281,6 +320,12 @@ def step_inference(
                 pred_trim = np.where(valid_trim > 0, pred_trim, 0).astype(np.uint8)
                 conf_trim = np.where(valid_trim > 0, conf_trim, 0).astype(np.uint8)
 
+                # 진단 통계
+                total_pixels += pred_trim.size
+                pred_pixels_class1 += int((pred_trim == 1).sum())
+                pred_pixels_class2 += int((pred_trim == 2).sum())
+                max_conf_seen = max(max_conf_seen, float(conf.max()))
+
                 w = Window(spec.write_x, spec.write_y, spec.write_width, spec.write_height)
                 mask_dst.write(pred_trim, 1, window=w)
                 conf_dst.write(conf_trim, 1, window=w)
@@ -288,6 +333,12 @@ def step_inference(
             pbar.update(len(batch_specs))
         pbar.close()
 
+    print(
+        f"[inference] {final_name}: total_pixels={total_pixels}, "
+        f"class1(신설/확장)={pred_pixels_class1}, class2(철거/축소)={pred_pixels_class2}, "
+        f"max_conf={max_conf_seen:.3f}, threshold={confidence_threshold}",
+        flush=True,
+    )
     return mask_path, conf_path, valid_path
 
 
@@ -384,6 +435,11 @@ def step_vectorize(
 ):
     """클래스 마스크를 폴리곤으로 변환 → v2-style 후처리 → 기존 GeoJSON 포맷으로 저장."""
     raw_features = []
+    n_total_shapes = 0
+    n_class_match = 0
+    n_after_pre_area = 0
+    n_after_postprocess = 0
+    n_final = 0
     with rasterio.open(str(mask_path)) as mask_src, \
          rasterio.open(str(conf_path)) as conf_src, \
          rasterio.open(str(valid_path)) as valid_src:
@@ -398,14 +454,17 @@ def step_vectorize(
             connectivity=8,
         )
         for geom, value in iterator:
+            n_total_shapes += 1
             class_id = int(value)
             if class_id not in CLASS_NAME_MAP:
                 continue
+            n_class_match += 1
             polygon = repair_geometry(shape(geom))
             if polygon is None or polygon.is_empty:
                 continue
             if polygon.area < min_area_m2:
                 continue
+            n_after_pre_area += 1
 
             # confidence는 후처리 전 raw 폴리곤 기준 (postprocess가 도형을 변형하므로)
             conf_val = polygon_mean_conf(conf_src, polygon)
@@ -413,6 +472,7 @@ def step_vectorize(
             transformed = postprocess_polygon_v2(polygon, mask_src, simplify_tolerance)
             if transformed is None:
                 continue
+            n_after_postprocess += 1
 
             for sub in iter_polygons(transformed):
                 if sub.area < min_area_m2:
@@ -426,6 +486,13 @@ def step_vectorize(
                     "cx": centroid.x,
                     "cy": centroid.y,
                 })
+                n_final += 1
+    print(
+        f"[vectorize] {img_name}: shapes={n_total_shapes}, "
+        f"class_match={n_class_match}, after_pre_area>=({min_area_m2})={n_after_pre_area}, "
+        f"after_postprocess={n_after_postprocess}, final={n_final}",
+        flush=True,
+    )
 
     # 기존 코드와 동일한 정렬: y desc, x desc
     raw_features.sort(key=lambda f: (f["cy"], f["cx"]), reverse=True)
