@@ -1,5 +1,5 @@
 services:
-  mambacd:
+  buildingcd:
     image: building_cd:latest
     volumes:
       - ./workspace:/workspace

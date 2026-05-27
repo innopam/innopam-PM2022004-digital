@@ -1,793 +1,783 @@
-import os
-import ray
-import json
-import time
-import imageio.v2 as imageio
-import rasterio
+"""
+건물 변화탐지 추론 스크립트 (urban_cd_v1 / DINOv3 + UPerNet 기반).
+
+기존 04_Building_CD 인터페이스 유지:
+  - 입력: <dataset_path>/T1/*.tif, <dataset_path>/T2/*.tif
+  - 출력: <output_path>/<img>.json, status.json
+  - 내부 산출물: <output_path>/results/<img>/<img>.tif, *_conf.tif, *_prob_*.tif
+
+내부 추론 엔진은 기존 Mamba/Ray/PNG 패치 방식에서 DINOv3 ViT-L/16
++ UPerNet sliding-window 직접 추론 방식으로 교체.
+
+클래스:
+  1 = 신축
+  2 = 소멸
+  3 = 갱신
+"""
+from __future__ import annotations
+
 import argparse
+import inspect
+import json
+import os
+import shutil
+import sys
+import time
+from pathlib import Path
+from typing import Sequence
+
 import numpy as np
-
+import rasterio
+import torch
+import yaml
+from rasterio.features import rasterize, shapes, sieve
+from rasterio.windows import Window, from_bounds
+from shapely.geometry import mapping, shape
 from tqdm import tqdm
-from rasterio.windows import Window
-from rasterio.features import shapes, rasterize
-from skimage.measure import label
-from shapely.ops import unary_union
-from shapely.geometry import Polygon, shape, mapping
 
-from MambaCD.changedetection.apis import Inferencer2
 
-# Ray 초기화 (필요하다면 수정)
-ray.shutdown()
-ray.init(num_cpus=os.cpu_count(), num_gpus=0)
+URBAN_CD_DIR = os.environ.get("URBAN_CD_DIR", "/root/urban_cd_v1")
+for path in (
+    f"{URBAN_CD_DIR}/common/src",
+    f"{URBAN_CD_DIR}/building_cd/phase3_semantic_cd/src",
+    f"{URBAN_CD_DIR}/road_cd/scripts",
+):
+    if path not in sys.path:
+        sys.path.insert(0, path)
 
-def make_args():
-    parser = argparse.ArgumentParser(description="Multiclass Change Detection system")
-    parser.add_argument("--opts", help="Modify config options by adding 'KEY VALUE' pairs. ",
-                        default=None, nargs='+')
-    parser.add_argument('--model_path', type=str, default='/workspace/model/')
-    parser.add_argument('--dataset_path', type=str, default='/workspace/sample_data/')
-    parser.add_argument('--output_path', type=str, default='/workspace/out/')
-    parser.add_argument('--multi_mode', type=bool, default=True)
-    parser.add_argument('--data_name_list', type=list)
-    parser.add_argument("--patch_size", type=int, default=512)
-    parser.add_argument("--overlap_ratio", type=str, default='25')
+from infer_real_ortho import (  # noqa: E402
+    PairInfo,
+    build_tile_specs,
+    preprocess_tiles,
+    repair_geometry,
+    resolve_clip_window,
+    trim_tile,
+)
+from phase3_semantic_cd import DirectionalSemanticChangeDetector  # noqa: E402
+
+
+DEFAULT_CONFIG = (
+    f"{URBAN_CD_DIR}/building_cd/phase3_semantic_cd/configs/"
+    "phase3_update14_phase2init_lvd_lora_last4_rankaux_v1.yaml"
+)
+DINOV3_BACKBONE_DIRNAME = "dinov3-vitl16-pretrain-lvd1689m"
+
+CLASS_NAME_MAP = {
+    1: "신축",
+    2: "소멸",
+    3: "갱신",
+}
+
+PERCENTILE_LOW = 2.0
+PERCENTILE_HIGH = 98.0
+SAMPLE_SIZE_FOR_SCALE = 2048
+
+
+def make_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Building change detection (urban_cd_v1)")
+    parser.add_argument("--model_path", type=str, default="/workspace/model/")
+    parser.add_argument("--dataset_path", type=str, default="/workspace/input/")
+    parser.add_argument("--output_path", type=str, default="/workspace/output/")
+    parser.add_argument("--patch_size", type=int, default=1024)
+    parser.add_argument(
+        "--overlap_ratio",
+        type=str,
+        default="25",
+        help="겹침 비율. 'min' 또는 0~100 사이의 퍼센트 값 (기본 25)",
+    )
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument(
+        "--confidence_threshold",
+        type=float,
+        default=0.7,
+        help="변화 클래스로 인정할 softmax confidence 하한",
+    )
+    parser.add_argument(
+        "--min_component_pixels",
+        type=int,
+        default=200,
+        help="클래스별 connected component 최소 픽셀 수. 0이면 비활성화",
+    )
+    parser.add_argument("--min_area_m2", type=float, default=20.0)
+    parser.add_argument("--simplify_tolerance", type=float, default=0.2)
     parser.add_argument("--status_file", type=str, default="status.json")
+    return parser.parse_args()
 
-    return parser
 
-def log_error(log_file_path, message):
-    with open(log_file_path,"a") as f:
-        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {message}\n")
+def overlap_to_pixels(overlap_ratio: str, patch_size: int) -> int:
+    if overlap_ratio == "min":
+        return 0
+    pct = float(overlap_ratio)
+    if not (0.0 <= pct < 100.0):
+        raise ValueError(f"overlap_ratio percent must be in [0, 100), got {pct}")
+    return int(round(patch_size * pct / 100.0))
 
-def update_status(status, status_file):
-    with open(status_file,"w") as f:
-        json.dump(status,f,indent=4)
 
 def measure_time(func):
     def wrapper(*args, **kwargs):
-        st= time.perf_counter()
-        res= func(*args, **kwargs)
-        et= time.perf_counter()
-        elapsed= et-st
-        return res, elapsed
+        start = time.perf_counter()
+        result = func(*args, **kwargs)
+        elapsed = time.perf_counter() - start
+        return result, elapsed
+
     return wrapper
 
-def calculate_patch_distribution(image_size, patch_size, save_dir, opt):
-    y_size, x_size = image_size
-    patch_height = patch_width = patch_size
 
-    if opt == 'min':
-        # 각 축의 패치 수 계산
-        y_patches = y_size // patch_height + 1
-        x_patches = x_size // patch_width + 1
-    
-        # 각 축의 나머지 계산
-        y_remainder = patch_size * y_patches - y_size
-        x_remainder = patch_size * x_patches - x_size
-    
-        # 중복 영역만 고려하여 overlap 비율 계산 (y_patches - 1, x_patches - 1)
-        y_overlap_distribution = [0] * (y_patches - 1)
-        x_overlap_distribution = [0] * (x_patches - 1)
-    
-        if y_remainder > 0:
-            # 나머지를 적절히 나누기 위한 패치 수 결정
-            y_chunks = int(np.floor(y_remainder / (y_patches - 1)))
-            for i in range(y_patches - 1):
-                if i < y_remainder % (y_patches - 1):
-                    y_overlap_distribution[i] = y_chunks + 1
-                else:
-                    y_overlap_distribution[i] = y_chunks
-    
-        if x_remainder > 0:
-            x_chunks = int(np.floor(x_remainder / (x_patches - 1)))
-            for i in range(x_patches - 1):
-                if i < x_remainder % (x_patches - 1):
-                    x_overlap_distribution[i] = x_chunks + 1
-                else:
-                    x_overlap_distribution[i] = x_chunks
+def init_status(output_path: str, status_file: str, total_step: int) -> None:
+    path = os.path.join(output_path, status_file)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "Total_step": total_step,
+                "Current_step": 0,
+                "Process": 0,
+                "Status": "pending",
+                "ElapsedTime": {},
+            },
+            f,
+            indent=4,
+            ensure_ascii=False,
+        )
+
+
+def update_status(output_path: str, status_file: str, **updates) -> dict:
+    path = os.path.join(output_path, status_file)
+    with open(path, "r", encoding="utf-8") as f:
+        status = json.load(f)
+    elapsed_update = updates.pop("_elapsed", None)
+    status.update(updates)
+    if elapsed_update:
+        status.setdefault("ElapsedTime", {}).update(elapsed_update)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(status, f, indent=4, ensure_ascii=False)
+    return status
+
+
+def log_error(output_path: str, message: str) -> None:
+    Path(output_path).mkdir(parents=True, exist_ok=True)
+    with open(os.path.join(output_path, "error_log.txt"), "a", encoding="utf-8") as f:
+        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {message}\n")
+
+
+def load_model_for_inference(model_path: Path, device: torch.device):
+    checkpoint_path = model_path / "best.pth"
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(
+            f"학습 체크포인트가 없습니다: {checkpoint_path}\n"
+            "workspace/model/best.pth 파일을 실제 Building DINOv3 가중치로 교체하세요."
+        )
+    if checkpoint_path.stat().st_size == 0:
+        raise FileNotFoundError(
+            f"체크포인트가 더미 파일입니다: {checkpoint_path}\n"
+            "사용 전에 최신 Building best.pth로 덮어쓰세요."
+        )
+
+    ckpt_size_mb = checkpoint_path.stat().st_size / (1024 ** 2)
+    print(f"[checkpoint] best.pth: size={ckpt_size_mb:.1f} MB", flush=True)
+    state = torch.load(str(checkpoint_path), map_location="cpu")
+
+    epoch = state.get("epoch", "<missing>")
+    best_metric_name = state.get("best_metric_name", state.get("best_metric", "<missing>"))
+    best_metric_value = state.get("best_metric_value", state.get("best_score", "<missing>"))
+    print(
+        f"[checkpoint] epoch={epoch}, best_metric={best_metric_name}, "
+        f"best_value={best_metric_value}",
+        flush=True,
+    )
+
+    cfg = state.get("config")
+    if cfg is None:
+        with open(DEFAULT_CONFIG, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+        print("[checkpoint] config NOT in .pth -> fallback to bundled YAML", flush=True)
     else:
-        if 0 <= float(opt) <= 100:
-            overlap_ratio = float(opt) / 100.
+        exp_name = cfg.get("experiment", {}).get("name", "<missing>")
+        num_classes = cfg.get("model", {}).get("decoder", {}).get("num_classes", "<missing>")
+        print(
+            f"[checkpoint] embedded config: experiment={exp_name}, "
+            f"decoder.num_classes={num_classes}",
+            flush=True,
+        )
 
-            effective_patch_size_y = int(np.ceil(patch_height * (1 - overlap_ratio)))
-            effective_patch_size_x = int(np.ceil(patch_width * (1 - overlap_ratio)))
-    
-            y_patches = int(np.ceil(y_size / effective_patch_size_y))
-            x_patches = int(np.ceil(x_size / effective_patch_size_x))
-    
-            y_overlap_distribution = [(patch_height-effective_patch_size_y)] * (y_patches-1)
-            x_overlap_distribution = [(patch_width-effective_patch_size_x)] * (x_patches-1)
-        else:
-            raise(ValueError("=> Please enter a valid overlap ratio (between 0 and 100)."))
+    dino_dir = model_path / DINOV3_BACKBONE_DIRNAME
+    safetensors_path = dino_dir / "model.safetensors"
+    if not safetensors_path.exists() or safetensors_path.stat().st_size == 0:
+        raise FileNotFoundError(
+            f"DINOv3 backbone 가중치를 찾을 수 없습니다: {safetensors_path}\n"
+            f"workspace/model/{DINOV3_BACKBONE_DIRNAME}/ 디렉토리에 "
+            "config.json, preprocessor_config.json, model.safetensors 를 배치하세요."
+        )
+    dino_size_mb = safetensors_path.stat().st_size / (1024 ** 2)
+    print(f"[checkpoint] DINOv3 model.safetensors: size={dino_size_mb:.1f} MB", flush=True)
 
-    # 총 패치 수 계산
-    total_patches = y_patches * x_patches
+    cfg["model"]["backbone"]["checkpoint_path"] = str(dino_dir)
 
-    # overlap 비율 계산
-    y_overlap_ratio = np.mean([y / patch_height for y in y_overlap_distribution]) * 100
-    x_overlap_ratio = np.mean([x / patch_width for x in x_overlap_distribution]) * 100
+    model_kwargs = {
+        "checkpoint_path": cfg["model"]["backbone"]["checkpoint_path"],
+        "output_layers": cfg["model"]["backbone"].get("output_layers", (6, 12, 18, 24)),
+        "freeze": cfg["model"]["backbone"].get("freeze", True),
+        "drop_path_rate": cfg["model"]["backbone"].get("drop_path_rate", 0.0),
+        "unfreeze_last_n_blocks": cfg["model"]["backbone"].get("unfreeze_last_n_blocks", 0),
+        "lora": cfg["model"]["backbone"].get("lora"),
+        "fusion_out_channels": cfg["model"]["neck"].get("out_channels", 256),
+        "scale_factors": cfg["model"]["neck"].get("scale_factors", (4.0, 2.0, 1.0, 0.5)),
+        "ppm_bins": cfg["model"]["decoder"].get("ppm_bins", (1, 2, 3, 6)),
+        "fpn_channels": cfg["model"]["decoder"].get("fpn_channels", 256),
+        "num_classes": cfg["model"]["decoder"].get("num_classes", 4),
+        "aux_head": cfg["model"].get("aux_head"),
+        "building_head": cfg["model"].get("building_head"),
+        "structural_branch": cfg["model"].get("structural_branch"),
+    }
+    supports_rank_aux = "rank_aux" in inspect.signature(DirectionalSemanticChangeDetector).parameters
+    if supports_rank_aux:
+        model_kwargs["rank_aux"] = cfg["model"].get("rank_aux")
 
-    # 각 overlap 분포의 개수 세기
-    y_distribution_count = {}
-    for value in y_overlap_distribution:
-        if value in y_distribution_count:
-            y_distribution_count[value] += 1
-        else:
-            y_distribution_count[value] = 1
+    model = DirectionalSemanticChangeDetector(**model_kwargs)
+    incompatible = model.load_state_dict(state["model_state"], strict=supports_rank_aux)
+    if not supports_rank_aux:
+        unexpected = [key for key in incompatible.unexpected_keys if key.startswith("rank_aux_")]
+        other_unexpected = [key for key in incompatible.unexpected_keys if not key.startswith("rank_aux_")]
+        if incompatible.missing_keys or other_unexpected:
+            raise RuntimeError(
+                "Checkpoint/model mismatch outside rank_aux fallback: "
+                f"missing={incompatible.missing_keys}, unexpected={other_unexpected[:10]}"
+            )
+        print(
+            f"[checkpoint] rank_aux fallback: ignored {len(unexpected)} auxiliary head keys "
+            "because installed urban_cd_v1 model.py does not define rank_aux. "
+            "Main inference logits are unaffected.",
+            flush=True,
+        )
+    model.to(device)
+    model.eval()
+    return model, cfg
 
-    x_distribution_count = {}
-    for value in x_overlap_distribution:
-        if value in x_distribution_count:
-            x_distribution_count[value] += 1
-        else:
-            x_distribution_count[value] = 1
 
-    # patch_distribution.txt 파일에 저장
-    with open(os.path.join(save_dir, "patch_distribution.txt"), "a") as f:
-        f.write(f"Image size: {image_size}\n")
-        f.write(f"Patch size: {patch_size}\n")
-        f.write(f"Patches along Y-axis: {y_patches}\n")
-        f.write(f"Patches along X-axis: {x_patches}\n")
-        f.write(f"Total patches: {total_patches}\n")
-        f.write(f"Y-axis overlap distribution: {y_distribution_count}\n")
-        f.write(f"X-axis overlap distribution: {x_distribution_count}\n")
-        f.write(f"Y-axis overlap ratio: {y_overlap_ratio:.2f}%\n")
-        f.write(f"X-axis overlap ratio: {x_overlap_ratio:.2f}%\n")
+def build_output_profile(t1_path: Path, clip_window):
+    clip_x, clip_y, clip_w, clip_h = clip_window
+    with rasterio.open(str(t1_path), IGNORE_COG_LAYOUT_BREAK="YES") as src:
+        transform = src.window_transform(Window(clip_x, clip_y, clip_w, clip_h))
+        profile = src.profile.copy()
+    block_size = max(16, min(512, clip_w, clip_h))
+    block_size -= block_size % 16
+    block_size = max(16, block_size)
+    profile.update(
+        driver="GTiff",
+        height=clip_h,
+        width=clip_w,
+        count=1,
+        dtype="uint8",
+        compress="lzw",
+        tiled=True,
+        blockxsize=block_size,
+        blockysize=block_size,
+        transform=transform,
+    )
+    return profile
 
-    return y_patches, x_patches, y_overlap_distribution, x_overlap_distribution
 
-@ray.remote
-def patch_maker(y, x, t1_path, t2_path, save_dir, img_name, width, height, patch_size, x_overlap_distribution, y_overlap_distribution):
+def compute_band_scale(band_sample: np.ndarray, dtype_str: str) -> tuple[float, float]:
+    if dtype_str == "uint8":
+        return 0.0, 255.0
+    arr = band_sample.astype(np.float32)
+    nonzero = arr[arr > 0]
+    if nonzero.size == 0:
+        return 0.0, 1.0
+    lo = float(np.percentile(nonzero, PERCENTILE_LOW))
+    hi = float(np.percentile(nonzero, PERCENTILE_HIGH))
+    if hi <= lo:
+        return lo, lo + 1.0
+    return lo, hi
+
+
+def compute_image_scales(src) -> list[tuple[float, float]]:
+    sw = min(SAMPLE_SIZE_FOR_SCALE, src.width)
+    sh = min(SAMPLE_SIZE_FOR_SCALE, src.height)
+    cx = max(0, (src.width - sw) // 2)
+    cy = max(0, (src.height - sh) // 2)
+    sample = src.read(indexes=(1, 2, 3), window=Window(cx, cy, sw, sh))
+    return [compute_band_scale(sample[i], src.dtypes[i]) for i in range(3)]
+
+
+def apply_band_scale(band_arr: np.ndarray, scale: tuple[float, float], dtype_str: str) -> np.ndarray:
+    if dtype_str == "uint8":
+        return band_arr.astype(np.uint8, copy=False)
+    lo, hi = scale
+    arr = band_arr.astype(np.float32)
+    clipped = np.clip(arr, lo, hi)
+    scaled = (clipped - lo) * (255.0 / (hi - lo))
+    return np.clip(scaled, 0, 255).astype(np.uint8)
+
+
+def read_tile_dtype_safe(src1, src2, clip_x: int, clip_y: int, spec, scales1: list, scales2: list):
+    read_window = Window(clip_x + spec.read_x, clip_y + spec.read_y, spec.read_width, spec.read_height)
+    raw1 = src1.read(indexes=(1, 2, 3), window=read_window)
+    raw2 = src2.read(indexes=(1, 2, 3), window=read_window)
+    t1_bands = [apply_band_scale(raw1[i], scales1[i], src1.dtypes[i]) for i in range(3)]
+    t2_bands = [apply_band_scale(raw2[i], scales2[i], src2.dtypes[i]) for i in range(3)]
+    t1 = np.moveaxis(np.stack(t1_bands, axis=0), 0, -1)
+    t2 = np.moveaxis(np.stack(t2_bands, axis=0), 0, -1)
+    valid = np.ones((spec.read_height, spec.read_width), dtype=bool)
+    return t1, t2, valid
+
+
+def log_input_properties(t1_path: Path, t2_path: Path) -> None:
+    for label, path in (("T1", t1_path), ("T2", t2_path)):
+        with rasterio.open(str(path), IGNORE_COG_LAYOUT_BREAK="YES") as src:
+            color_interp = tuple(c.name for c in src.colorinterp)
+            print(
+                f"[input] {label} {path.name}: size={src.width}x{src.height}, "
+                f"bands={src.count}, dtypes={src.dtypes}, color_interp={color_interp}",
+                flush=True,
+            )
+            tr = src.transform
+            print(
+                f"[input] {label} transform: a={tr.a:.4f}, b={tr.b:.4f}, "
+                f"c={tr.c:.2f}, d={tr.d:.4f}, e={tr.e:.4f}, f={tr.f:.2f}",
+                flush=True,
+            )
+
+
+def validate_pair_relaxed(t1_path: Path, t2_path: Path) -> PairInfo:
     with rasterio.open(t1_path, IGNORE_COG_LAYOUT_BREAK="YES") as src1, \
-    rasterio.open(t2_path, IGNORE_COG_LAYOUT_BREAK="YES") as src2:
-        start_x = max(0, x * patch_size - sum(x_overlap_distribution[:x]))
-        start_y = max(0, y * patch_size - sum(y_overlap_distribution[:y]))
-        end_x = min(start_x + patch_size, width)
-        end_y = min(start_y + patch_size, height)
+         rasterio.open(t2_path, IGNORE_COG_LAYOUT_BREAK="YES") as src2:
+        for attr in ("width", "height"):
+            if getattr(src1, attr) != getattr(src2, attr):
+                raise ValueError(
+                    f"Raster mismatch for {attr}: {getattr(src1, attr)} != {getattr(src2, attr)}"
+                )
+        if src1.count < 3 or src2.count < 3:
+            raise ValueError(f"Both rasters must contain at least 3 bands (T1={src1.count}, T2={src2.count})")
+        if (src1.crs is None) ^ (src2.crs is None) or (
+            src1.crs is not None and src2.crs is not None and src1.crs != src2.crs
+        ):
+            raise ValueError(f"CRS mismatch: {src1.crs} != {src2.crs}")
 
-        # 디스크에 기록 (해당 window 영역)
-        window = Window(start_x, start_y, end_x - start_x, end_y - start_y)
+        t1, t2 = src1.transform, src2.transform
+        max_drift = max(
+            abs(t1.a - t2.a),
+            abs(t1.b - t2.b),
+            abs(t1.d - t2.d),
+            abs(t1.e - t2.e),
+            abs(t1.c - t2.c) / max(abs(t1.a), 1e-9),
+            abs(t1.f - t2.f) / max(abs(t1.e), 1e-9),
+        )
+        if max_drift > 0.5:
+            print(f"[warn] transform drift max={max_drift:.4f} pixel; proceeding", flush=True)
 
-        patch_t1 = np.transpose(src1.read(window=window), (1, 2, 0))[:,:,:3].astype(np.uint8)
-        patch_t2 = np.transpose(src2.read(window=window), (1, 2, 0))[:,:,:3].astype(np.uint8)
-        # patch_t2 = adjust_img(patch_t2, patch_t1)
+        return PairInfo(
+            t1_path=str(t1_path),
+            t2_path=str(t2_path),
+            width=src1.width,
+            height=src1.height,
+            count=src1.count,
+            crs=src1.crs.to_string() if src1.crs else None,
+            res_x=float(src1.res[0]),
+            res_y=float(src1.res[1]),
+            pixel_area=float(abs(src1.transform.a * src1.transform.e)),
+        )
 
-        imageio.imwrite(os.path.join(save_dir, "T1", f"{img_name}_{y}_{x}.png"), patch_t1)
-        imageio.imwrite(os.path.join(save_dir, "T2", f"{img_name}_{y}_{x}.png"), patch_t2)
-
-    with open(os.path.join(save_dir, "data_list.txt"), "a") as train_file:
-        train_file.write(f"{img_name}_{y}_{x}.png\n")
-
-def make_patch(t1_path, t2_path, save_dir, patch_size, img_name, overlap_ratio):
-    """
-    대규모 이미지를 청크(window) 단위로 나누어 패치를 생성.
-    """
-    with rasterio.open(t1_path, IGNORE_COG_LAYOUT_BREAK="YES") as src1, \
-        rasterio.open(t2_path, "r+", IGNORE_COG_LAYOUT_BREAK="YES") as src2:
-        if (src1.width != src2.width) or (src1.height != src2.height):
-            raise ValueError("Shape mismatch")
-
-        width, height = src1.width, src1.height
-        metadata = src2.meta.copy()
-        metadata.update({"driver": "GTiff", "dtype": "uint8",
-                         "height": height, 'width': width,
-                         'blockxsize': patch_size, 'blockysize': patch_size,
-                         'tiled': False})
-        if 'crs' in metadata:
-            metadata['crs'] = str(metadata['crs'].to_wkt()) 
-        metadata = {k: v for k, v in metadata.items() if k != 'count'}
-
-        os.makedirs(save_dir, exist_ok=True)
-        os.makedirs(os.path.join(save_dir,"T1"), exist_ok=True)
-        os.makedirs(os.path.join(save_dir,"T2"), exist_ok=True)
-
-        with open(os.path.join(save_dir, "patch_distribution.txt"), "w") as f:
-            f.write(f"--------{img_name} patch distribution--------\n")
-        
-        y_patches, x_patches, y_overlap_distribution, x_overlap_distribution = calculate_patch_distribution((src1.height, src1.width), patch_size, save_dir, overlap_ratio)
-
-        with open(os.path.join(save_dir, "data_list.txt"), "w") as f:
-            pass
-
-    tasks=[]
-    for y in range(y_patches):
-        for x in range(x_patches):
-            tasks.append(patch_maker.remote(
-                y=y, 
-                x=x, 
-                t1_path=t1_path, 
-                t2_path=t2_path, 
-                save_dir=save_dir, 
-                img_name=img_name, 
-                width=width, 
-                height=height, 
-                patch_size=patch_size, 
-                x_overlap_distribution=x_overlap_distribution, 
-                y_overlap_distribution=y_overlap_distribution
-                ))
-    pbar = tqdm(total=len(tasks), desc=f"Creating patches for {img_name}...")
-    while tasks:
-        done_tasks, tasks = ray.wait(tasks, num_returns=1)
-        for _ in done_tasks:
-            pbar.update(1)  # 진행률 업데이트
-    pbar.close()  # 작업 완료 후 tqdm 닫기
-
-    with open(os.path.join(save_dir, f"{img_name}_metadata.json"), 'w') as metadata_file:
-        json.dump(metadata, metadata_file, indent=4)
 
 @measure_time
-def inference(args, mode, img_name):
-    # 모델 로직 건드리지 않음
-    inf= Inferencer2(args, mode, img_name)
-    inf.infer()
-    return "추론 완료"
+def step_patch(t1_path: Path, t2_path: Path, patch_size: int, overlap_px: int):
+    log_input_properties(t1_path, t2_path)
+    pair_info = validate_pair_relaxed(t1_path, t2_path)
+    clip_window = resolve_clip_window(pair_info, None)
+    clip_x, clip_y, clip_w, clip_h = clip_window
+    specs = build_tile_specs(clip_w, clip_h, patch_size, overlap_px)
+    print(
+        f"[tiles] patch_size={patch_size}, overlap_px={overlap_px}, "
+        f"tiles={len(specs)}, clip={clip_window}",
+        flush=True,
+    )
+    return pair_info, clip_window, specs
 
-@ray.remote
-def reconstruct_patch(y, x, color_map, img_name, out_dir, image_size, patch_size, x_overlap_list, y_overlap_list):
-    patch_path = os.path.join(out_dir, "pred", f"{img_name}_{y}_{x}.png")
-    conf_path = os.path.join(out_dir, "confidence", f"{img_name}_{y}_{x}_confidence.png")
 
-    # 원본 TIFF 이미지의 크기 설정
-    y_size, x_size = image_size
-    
-    # 존재하지 않는 패치 파일이 있을 경우 건너뜀
-    if not os.path.exists(patch_path) or not os.path.exists(conf_path):
-        return None
+@measure_time
+def step_inference(
+    model,
+    cfg: dict,
+    t1_path: Path,
+    t2_path: Path,
+    clip_window,
+    specs: Sequence,
+    result_dir: Path,
+    final_name: str,
+    batch_size: int,
+    confidence_threshold: float,
+    device: torch.device,
+):
+    clip_x, clip_y, clip_w, clip_h = clip_window
+    mask_path = result_dir / f"{final_name}.tif"
+    conf_path = result_dir / f"{final_name}_conf.tif"
+    valid_path = result_dir / f"{final_name}_valid.tif"
+    prob_paths = {
+        class_id: result_dir / f"{final_name}_prob_{class_id}.tif"
+        for class_id in CLASS_NAME_MAP
+    }
 
-    # 패치 읽기
-    patch_rgb = imageio.imread(patch_path)
-    patch_conf = imageio.imread(conf_path)
+    profile = build_output_profile(t1_path, clip_window)
+    mean = cfg["data"]["aug"]["normalize_mean"]
+    std = cfg["data"]["aug"]["normalize_std"]
+    num_classes = int(cfg["model"]["decoder"].get("num_classes", 4))
+    autocast_enabled = device.type == "cuda"
+    autocast_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
 
-    # RGB 패치를 클래스 ID로 변환
-    patch_class = np.zeros((patch_rgb.shape[0], patch_rgb.shape[1]), dtype=np.uint8)
-    for color, mapped_value in color_map.items():
-        mask = np.all(patch_rgb == color, axis=-1)
-        patch_class[mask] = mapped_value
+    total_pixels = 0
+    pred_pixels = {class_id: 0 for class_id in CLASS_NAME_MAP}
+    max_conf_seen = 0.0
 
-    # 시작 좌표 계산
-    start_x = max(0, x * patch_size - sum(x_overlap_list[:x]))
-    start_y = max(0, y * patch_size - sum(y_overlap_list[:y]))
-    end_x = min(start_x + patch_rgb.shape[1], x_size)
-    end_y = min(start_y + patch_rgb.shape[0], y_size)
+    with rasterio.open(str(t1_path), IGNORE_COG_LAYOUT_BREAK="YES") as src1, \
+         rasterio.open(str(t2_path), IGNORE_COG_LAYOUT_BREAK="YES") as src2, \
+         rasterio.open(str(mask_path), "w", BIGTIFF="YES", **profile) as mask_dst, \
+         rasterio.open(str(conf_path), "w", BIGTIFF="YES", **profile) as conf_dst, \
+         rasterio.open(str(valid_path), "w", BIGTIFF="YES", **profile) as valid_dst, \
+         rasterio.open(str(prob_paths[1]), "w", BIGTIFF="YES", **profile) as prob1_dst, \
+         rasterio.open(str(prob_paths[2]), "w", BIGTIFF="YES", **profile) as prob2_dst, \
+         rasterio.open(str(prob_paths[3]), "w", BIGTIFF="YES", **profile) as prob3_dst:
 
-    # 디스크에 기록 (해당 window 영역)
-    window = Window(start_x, start_y, end_x - start_x, end_y - start_y)
+        prob_dsts = {1: prob1_dst, 2: prob2_dst, 3: prob3_dst}
+        scales1 = compute_image_scales(src1)
+        scales2 = compute_image_scales(src2)
+        print(
+            f"[normalize] {final_name}: T1 dtypes={src1.dtypes} scales={scales1}, "
+            f"T2 dtypes={src2.dtypes} scales={scales2}",
+            flush=True,
+        )
 
-    return (patch_class[:end_y - start_y, :end_x - start_x],
-            patch_conf[:end_y - start_y, :end_x - start_x],
-            window)
+        pbar = tqdm(total=len(specs), desc=f"Inferring {final_name}")
+        for start in range(0, len(specs), batch_size):
+            batch_specs = list(specs[start:start + batch_size])
+            t1_tiles, t2_tiles, valid_tiles = [], [], []
+            for spec in batch_specs:
+                t1, t2, valid = read_tile_dtype_safe(src1, src2, clip_x, clip_y, spec, scales1, scales2)
+                t1_tiles.append(t1)
+                t2_tiles.append(t2)
+                valid_tiles.append(valid)
 
-def reconstruct_tiff_from_patches(save_dir, out_dir, mode, img_name):
-    # (a) patch_distribution.txt 읽기
-    patch_distribution_path = os.path.join(save_dir, "patch_distribution.txt")
-    with open(patch_distribution_path, "r") as f:
-        lines = f.readlines()
-        image_size = tuple(map(int, lines[1].split(": ")[1].strip("()\n").split(", ")))
-        patch_size = int(lines[2].split(": ")[1].strip())
-        y_patches  = int(lines[3].split(": ")[1].strip())
-        x_patches  = int(lines[4].split(": ")[1].strip())
-        y_overlap_distribution = eval(lines[6].split("n: ")[1].strip())
-        x_overlap_distribution = eval(lines[7].split("n: ")[1].strip())
+            t1_tensor, t2_tensor, pad = preprocess_tiles(t1_tiles, t2_tiles, mean, std, device)
+            with torch.inference_mode():
+                with torch.autocast(device_type=device.type, dtype=autocast_dtype, enabled=autocast_enabled):
+                    outputs = model(t1_tensor, t2_tensor)
+                    logits = outputs["main"] if isinstance(outputs, dict) else outputs
+                    probs = torch.softmax(logits.float(), dim=1).cpu().numpy()
 
-        # 오버랩 리스트
-        y_overlap_list = [k for k, v in y_overlap_distribution.items() for _ in range(v)]
-        x_overlap_list = [k for k, v in x_overlap_distribution.items() for _ in range(v)]
+            pad_h, pad_w = pad
+            if pad_h or pad_w:
+                probs = probs[:, :, : probs.shape[2] - pad_h, : probs.shape[3] - pad_w]
 
-    # (b) 메타데이터
-    with open(os.path.join(save_dir, f"{img_name}_metadata.json"), 'r') as metadata_file:
-        metadata = json.load(metadata_file)
-        metadata.update({
-            'tiled': True,
-            'interleave': 'band'
-        })
+            for idx, spec in enumerate(batch_specs):
+                prob = probs[idx]
+                pred = prob.argmax(axis=0).astype(np.uint8)
+                conf = prob.max(axis=0)
+                pred = np.where((pred > 0) & (conf >= confidence_threshold), pred, 0).astype(np.uint8)
+                valid = valid_tiles[idx].astype(np.uint8)
+                conf_u8 = np.clip(np.rint(conf * 255.0), 0, 255).astype(np.uint8)
 
-    # (c) color_map 설정
-    if mode:
-        color_map = {
-            (0, 0, 0): 0, (255, 0, 0): 1, (0, 255, 0): 2,
-            (0, 0, 255): 3, (255, 255, 0): 4, (255, 0, 255): 5,
-            (0, 255, 255): 6, (255, 255, 255): 7
-        }
-    else:
-        color_map = {(0, 0, 0): 0, (255, 255, 255): 1}
+                pred_trim = trim_tile(pred, spec)
+                conf_trim = trim_tile(conf_u8, spec)
+                valid_trim = trim_tile(valid, spec)
+                pred_trim = np.where(valid_trim > 0, pred_trim, 0).astype(np.uint8)
+                conf_trim = np.where(valid_trim > 0, conf_trim, 0).astype(np.uint8)
 
-    # (d) 최종 결과 TIFF (없으면 생성)
-    output_img_path  = os.path.join(out_dir, f"{img_name}.tif")
-    output_conf_path = os.path.join(out_dir, f"{img_name}_conf.tif")
-    if not os.path.exists(output_img_path):
-        with rasterio.open(output_img_path, 'w', BIGTIFF='YES', count=1, **metadata) as dst_img, \
-             rasterio.open(output_conf_path, 'w', BIGTIFF='YES', count=1, **metadata) as dst_conf:
-            pass
+                prob_trims = {}
+                for class_id in CLASS_NAME_MAP:
+                    if class_id < num_classes:
+                        prob_u8 = np.clip(np.rint(prob[class_id] * 255.0), 0, 255).astype(np.uint8)
+                    else:
+                        prob_u8 = np.zeros_like(conf_u8)
+                    prob_trim = trim_tile(prob_u8, spec)
+                    prob_trims[class_id] = np.where(valid_trim > 0, prob_trim, 0).astype(np.uint8)
 
-    # (e) Ray로 패치 병렬 처리 -> (patch_class, patch_conf, window) 가져오기
-    tasks_list = []
-    for y in range(y_patches):
-        for x in range(x_patches):
-            ref = reconstruct_patch.remote(
-                y=y,
-                x=x,
-                color_map=color_map,
-                img_name=img_name, 
-                out_dir=out_dir, 
-                image_size=image_size,
-                patch_size=patch_size, 
-                x_overlap_list=x_overlap_list, 
-                y_overlap_list=y_overlap_list
-            )
-            tasks_list.append((y, x, ref))
+                total_pixels += pred_trim.size
+                for class_id in CLASS_NAME_MAP:
+                    pred_pixels[class_id] += int((pred_trim == class_id).sum())
+                max_conf_seen = max(max_conf_seen, float(conf.max()))
 
-    # (f) 결과를 차례로 받아오면서(또는 전부 모아서) TIFF에 write
-    pbar = tqdm(total=len(tasks_list), desc=f"Reconstructing {img_name}...")
-    with rasterio.open(output_img_path, 'r+') as dst_img, \
-         rasterio.open(output_conf_path, 'r+') as dst_conf:
+                window = Window(spec.write_x, spec.write_y, spec.write_width, spec.write_height)
+                mask_dst.write(pred_trim, 1, window=window)
+                conf_dst.write(conf_trim, 1, window=window)
+                valid_dst.write(valid_trim, 1, window=window)
+                for class_id, prob_trim in prob_trims.items():
+                    prob_dsts[class_id].write(prob_trim, 1, window=window)
+            pbar.update(len(batch_specs))
+        pbar.close()
 
-        # Ray.wait()로 하나씩 가져오면서 쓰기(또는 ray.get(tasks)로 한꺼번에 받아도 됨)
-        remaining_refs = [t[2] for t in tasks_list]
-        while remaining_refs:
-            done_refs, remaining_refs = ray.wait(remaining_refs, num_returns=1)
-            done_ref = done_refs[0]
-            # 어느 (y, x)에 해당하는지 찾아야 하므로 인덱스를 매칭
-            done_task = None
-            for (yy, xx, rr) in tasks_list:
-                if rr == done_ref:
-                    done_task = (yy, xx, rr)
-                    break
+    print(
+        f"[inference] {final_name}: total_pixels={total_pixels}, "
+        f"class1(신축)={pred_pixels[1]}, class2(소멸)={pred_pixels[2]}, "
+        f"class3(갱신)={pred_pixels[3]}, max_conf={max_conf_seen:.3f}, "
+        f"threshold={confidence_threshold}",
+        flush=True,
+    )
+    return mask_path, conf_path, valid_path, prob_paths
 
-            if done_task is not None:
-                patch_result = ray.get(done_task[2])  # (patch_class, patch_conf, window) or None
-                if patch_result is not None:
-                    patch_class, patch_conf, window = patch_result
-                    dst_img.write(patch_class, 1, window=window)
-                    dst_conf.write(patch_conf, 1, window=window)
 
-            pbar.update(1)
-    pbar.close()
+@measure_time
+def step_reconstruct():
+    return "no-op"
 
-def get_overlapping_windows(height, width, patch_size, overlap=0.25):
-    """오버랩된 윈도우 좌표 생성"""
-    step_size = int(patch_size * (1 - overlap))
-    windows = []
-    
-    for y in range(0, height, step_size):
-        if y + patch_size > height:
-            y = max(0, height - patch_size)
-        for x in range(0, width, step_size):
-            if x + patch_size > width:
-                x = max(0, width - patch_size)
-            windows.append(rasterio.windows.Window(x, y, 
-                                                 min(patch_size, width - x),
-                                                 min(patch_size, height - y)))
-    return windows
 
-@ray.remote
-def polygonize_window(label_array, label_id, pixel_area, min_area, block_array, block_transform):
-    obj_mask = label_array == label_id
-    total_area = float(np.sum(obj_mask))
-
-    if not np.any(obj_mask) or total_area * pixel_area < min_area:
+def apply_component_filter(mask_path: Path, min_pixels: int) -> None:
+    if min_pixels <= 0:
         return
+    with rasterio.open(str(mask_path)) as src:
+        profile = src.profile.copy()
+        mask = src.read(1)
+    cleaned = np.zeros_like(mask, dtype=np.uint8)
+    for class_id in CLASS_NAME_MAP:
+        class_mask = (mask == class_id).astype(np.uint8)
+        if class_mask.any():
+            filtered = sieve(class_mask, size=min_pixels, connectivity=8)
+            cleaned[filtered == 1] = class_id
+    with rasterio.open(str(mask_path), "w", **profile) as dst:
+        dst.write(cleaned, 1)
 
-    unique_classes = np.unique(block_array[obj_mask])
 
-    features = []
-    for cls in unique_classes:
-        if cls == 0:  # 배경 클래스 제외
-            continue
+def polygon_mean_probability(prob_src, polygon) -> float:
+    window = from_bounds(*polygon.bounds, transform=prob_src.transform)
+    window = window.round_offsets().round_lengths()
+    col_off = max(0, int(window.col_off))
+    row_off = max(0, int(window.row_off))
+    width = min(prob_src.width - col_off, max(1, int(window.width)))
+    height = min(prob_src.height - row_off, max(1, int(window.height)))
+    window = Window(col_off, row_off, width, height)
+    data = prob_src.read(1, window=window)
+    transform = prob_src.window_transform(window)
+    mask = rasterize([(polygon, 1)], out_shape=data.shape, fill=0, transform=transform, dtype=np.uint8)
+    valid_values = data[mask == 1]
+    if valid_values.size == 0:
+        return 0.0
+    return float(valid_values.mean() / 255.0)
 
-        cls_mask = ((block_array == cls) & obj_mask).astype(np.uint8)
 
-        polygons = []
-        for geom, val in shapes(cls_mask, transform=block_transform):
-            # val이 1이면 해당 픽셀이 cls_mask 내 'True(1)'인 영역
-            if val == 1:
-                poly = shape(geom)
-                # 유효 여부와 최소 면적 조건 확인
-                if poly.is_valid and poly.area > min_area:
-                    polygons.append(poly)
+def iter_polygons(geom):
+    if geom is None or geom.is_empty:
+        return []
+    if geom.geom_type == "Polygon":
+        return [geom]
+    if geom.geom_type == "MultiPolygon":
+        return [p for p in geom.geoms if not p.is_empty]
+    return []
 
-        if polygons:
-            outer_polygon = max(polygons, key=lambda p: p.area)
-            features.append({
+
+@measure_time
+def step_vectorize(
+    mask_path: Path,
+    valid_path: Path,
+    prob_paths: dict[int, Path],
+    output_json_path: Path,
+    img_name: str,
+    min_area_m2: float,
+    simplify_tolerance: float,
+):
+    raw_features = []
+    n_total_shapes = 0
+    n_class_match = 0
+    n_after_area = 0
+
+    with rasterio.open(str(mask_path)) as mask_src, \
+         rasterio.open(str(valid_path)) as valid_src, \
+         rasterio.open(str(prob_paths[1])) as prob1_src, \
+         rasterio.open(str(prob_paths[2])) as prob2_src, \
+         rasterio.open(str(prob_paths[3])) as prob3_src:
+
+        prob_srcs = {1: prob1_src, 2: prob2_src, 3: prob3_src}
+        crs = mask_src.crs
+        crs_str = f"EPSG:{crs.to_epsg()}" if crs and crs.to_epsg() else str(crs) if crs else None
+
+        iterator = shapes(
+            rasterio.band(mask_src, 1),
+            mask=rasterio.band(valid_src, 1),
+            transform=mask_src.transform,
+            connectivity=8,
+        )
+        for geom, value in iterator:
+            n_total_shapes += 1
+            class_id = int(value)
+            if class_id not in CLASS_NAME_MAP:
+                continue
+            n_class_match += 1
+            polygon = repair_geometry(shape(geom))
+            if polygon is None:
+                continue
+            if simplify_tolerance > 0:
+                polygon = polygon.simplify(simplify_tolerance, preserve_topology=True)
+                polygon = repair_geometry(polygon)
+            if polygon is None:
+                continue
+            for sub in iter_polygons(polygon):
+                if sub.area < min_area_m2:
+                    continue
+                n_after_area += 1
+                conf_val = polygon_mean_probability(prob_srcs[class_id], sub)
+                centroid = sub.centroid
+                raw_features.append(
+                    {
+                        "polygon": sub,
+                        "class_id": class_id,
+                        "area": float(sub.area),
+                        "conf": conf_val,
+                        "cx": centroid.x,
+                        "cy": centroid.y,
+                    }
+                )
+
+    print(
+        f"[vectorize] {img_name}: shapes={n_total_shapes}, class_match={n_class_match}, "
+        f"after_area>={min_area_m2}={n_after_area}, final={len(raw_features)}",
+        flush=True,
+    )
+
+    raw_features.sort(key=lambda f: (f["cy"], f["cx"]), reverse=True)
+    geojson_features = []
+    for idx, feature in enumerate(raw_features, start=1):
+        geojson_features.append(
+            {
                 "type": "Feature",
                 "properties": {
-                    "CLS_ID": int(cls),
-                    "AREA": outer_polygon.area
+                    "CLS_ID": feature["class_id"],
+                    "CLS_NAME": CLASS_NAME_MAP[feature["class_id"]],
+                    "CONF": round(feature["conf"] * 100.0, 2),
+                    "AREA": round(feature["area"], 2),
+                    "ID": idx,
                 },
-                "geometry": {
-                    "type": "Polygon",
-                    "coordinates": [list(outer_polygon.exterior.coords)]
-                }
-            })
-    return features
+                "geometry": mapping(feature["polygon"]),
+            }
+        )
 
-def post_process_features(all_features, conf_path, transform, color_map, tolerance=0.5):
-    class_features = {}
-    for feature in all_features:
-        cls_id = feature["properties"]["CLS_ID"]
-        polygon = shape(feature["geometry"])
-        if cls_id not in class_features:
-            class_features[cls_id] = []
-        class_features[cls_id].append(polygon)
-    
-    # 같은 클래스의 객체 병합
-    merged_features = []
-    for cls_id, polygons in class_features.items():
-        union_polygon = unary_union(polygons)
-        if union_polygon.geom_type == 'Polygon':
-            polygons = [union_polygon]  # 리스트로 감싸기
-        else:
-            polygons = union_polygon.geoms
-        for poly in polygons:
-            if poly.is_valid:
-                minx = abs(int((poly.bounds[0] - transform[2]) / transform[0]))
-                miny = abs(int((poly.bounds[3] - transform[5]) / transform[4]))
-                maxx = abs(int((poly.bounds[2] - transform[2]) / transform[0]))
-                maxy = abs(int((poly.bounds[1] - transform[5]) / transform[4]))
-
-                pixel_coords = [(
-                    abs(abs(int((y - transform[2]) / transform[0])) - minx),
-                    abs(abs(int((x - transform[5]) / transform[4])) - miny)) 
-                    for y, x in poly.exterior.coords]
-                
-                # width와 height 계산
-                width = max(1, abs(maxx - minx))
-                height = max(1, abs(maxy - miny))
-                
-                window = Window(minx, miny, width, height)
-                with rasterio.open(conf_path) as conf_src:
-                    conf_raster = conf_src.read(1, window=window)
-
-                    pixel_polygon = Polygon(pixel_coords)
-                    rasterized = rasterize(
-                        [(pixel_polygon, 1)],
-                        out_shape=conf_raster.shape,
-                        fill=0,
-                        dtype=np.uint8)
-    
-                    # 마스크를 사용해 해당 영역의 conf_array 값 추출
-                    masked_conf = conf_raster * rasterized  # 래스터화된 부분만 추출
-                    valid_conf = masked_conf[masked_conf > 0]
-                    if valid_conf.size == 0:
-                        conf_mean = np.nan
-                    else:
-                        conf_mean = valid_conf.mean()
-
-                merged_features.append({
-                    "type": "Feature",
-                    "properties": {
-                        "CLS_ID": cls_id,
-                        "CLS_NAME": color_map[cls_id],
-                        "CONF": round(conf_mean, 2),
-                        "AREA": round(poly.area, 2)
-                    },
-                    "geometry": mapping(poly)
-                })
-    
-    # 유효한 features만 남김
-    processed_features = [f for f in merged_features if f is not None]
-
-    # 중심점 기준으로 정렬
-    features_with_centroids = []
-    for feature in processed_features:
-        poly = shape(feature["geometry"])
-        centroid = poly.centroid
-        features_with_centroids.append((centroid.x, centroid.y, feature))
-    
-    # y좌표 오름차순, x좌표 오름차순으로 정렬
-    sorted_features = sorted(features_with_centroids, 
-                           key=lambda x: (x[1], x[0]), reverse=True)
-    
-    # 정렬된 순서대로 ID 부여
-    for idx, (_, _, feature) in enumerate(sorted_features, start=1):
-        poly = shape(feature["geometry"]).simplify(tolerance=tolerance)
-        feature["geometry"] = mapping(poly)
-        feature["properties"]["CLS_NAME"] = color_map[int(feature["properties"]["CLS_ID"])]
-        feature["properties"]["ID"] = idx
-    
-    return [feature for _, _, feature in sorted_features]
-
-def polygonize(out_dir, mode, img_name, patch_size, overlap=0.25, min_area=50):
-    """메인 벡터화 함수"""
-    input_tif_path = os.path.join(out_dir, f"{img_name}.tif")
-    conf_path = os.path.join(out_dir, f"{img_name}_conf.tif")
-    output_json_path = os.path.join(out_dir, f"{img_name}.json")
-
-    if mode:
-        color_map = {1: "신축", 2: "소멸", 3: "갱신", 4: "색상변화", 
-        5: "더미 1", 6: "더미 2", 7: "더미 3"}
-    else:
-        color_map = {1: "변화"}
-
-    with rasterio.open(input_tif_path) as src:
-        transform = src.transform
-        pixel_area = abs(transform[0] * transform[4])
-        crs = src.crs
-        if crs:
-            crs = f"EPSG:{crs.to_epsg()}"
-        geojson_data = {
+    geojson_data = {
         "type": "FeatureCollection",
-        "crs": {"type": "name", "properties": {"name": f"{crs}"}},
+        "crs": {"type": "name", "properties": {"name": f"{crs_str}"}},
         "map_number": img_name,
-        "features": []
-        }
-        windows = get_overlapping_windows(src.height, src.width, patch_size, overlap)
-        all_features = []
-        # 블록 단위로 데이터 읽기 및 처리
-        pbar = tqdm(total=len(windows), desc=f"Vectorizing {img_name}...")
-        for window in windows:
-            # 블록 데이터 읽기
-            block_array = src.read(1, window=window)
-            block_array_ref = ray.put(block_array)
-            block_transform = src.window_transform(window)
-            # 레이블링 및 객체 마스크 생성
-            label_array = label(block_array > 0, connectivity=2)
-            label_array_ref = ray.put(label_array)
-            tasks = []
-            for label_id in range(1, label_array.max() + 1):
-                tasks.append(polygonize_window.remote(
-                    label_array=label_array_ref,
-                    label_id=label_id, 
-                    pixel_area=pixel_area, 
-                    min_area=min_area, 
-                    block_array=block_array_ref, 
-                    block_transform=block_transform, 
-                ))
-            while tasks:
-                done_tasks, tasks = ray.wait(tasks, num_returns=1)
-                for result in done_tasks:
-                    feature = ray.get(result)
-                    if feature:
-                        all_features.extend(feature)
-            pbar.update(1)  # 진행률 업데이트
-        pbar.close()  # 작업 완료 후 tqdm 닫기
-        # 중첩된 폴리곤 병합
-        processed_features = post_process_features(all_features, conf_path, transform, color_map)
-        geojson_data["features"] = processed_features
-    # 결과 저장
-    with open(output_json_path, "w") as f:
-        json.dump(geojson_data, f, indent=4)
+        "features": geojson_features,
+    }
+    with open(output_json_path, "w", encoding="utf-8") as f:
+        json.dump(geojson_data, f, indent=4, ensure_ascii=False)
 
-@measure_time
-def reconstruct(infer_dataset_path, result_saved_path, mode, img_name):
-    reconstruct_tiff_from_patches(infer_dataset_path, result_saved_path, mode, img_name)
-    return "재구성 완료"
+    return f"Vectorization done: {len(geojson_features)} features"
 
-@measure_time
-def vectorize(result_saved_path, mode, img_name, patch_size):
-    polygonize(result_saved_path, mode, img_name, patch_size)
-    return "벡터화 완료"
 
-#######################################################
-# 단계별 함수 (step_patch / step_inference / step_reconstruct / step_vectorize)
-#######################################################
-@measure_time
-def step_patch(args, t1_file, t2_file, final_name):
-    status_file= os.path.join(args.output_path, args.status_file)
+def main() -> None:
+    args = make_args()
 
-    with open(status_file,"r") as f:
-        st= json.load(f)
+    torch.set_float32_matmul_precision("high")
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
-    patch_dir= os.path.join(args.output_path,"patches", final_name)
-    os.makedirs(patch_dir, exist_ok=True)
-    
-    t1_path= os.path.join(args.dataset_path,"T1", t1_file)
-    t2_path= os.path.join(args.dataset_path,"T2", t2_file)
+    init_t1_path = Path(args.dataset_path) / "T1"
+    init_t2_path = Path(args.dataset_path) / "T2"
+    t1_files = sorted(p.name for p in init_t1_path.glob("*.tif"))
+    t2_files = sorted(p.name for p in init_t2_path.glob("*.tif"))
+    if t1_files != t2_files:
+        raise RuntimeError("=> Please match before/after image filenames")
 
-    make_patch(t1_path, t2_path, patch_dir,
-               args.patch_size, final_name, args.overlap_ratio)
+    output_root = Path(args.output_path)
+    output_root.mkdir(parents=True, exist_ok=True)
+    init_status(args.output_path, args.status_file, total_step=len(t1_files))
 
-    # step 완료 -> status 업데이트
-    st["Process"]= 20
-    st["ElapsedTime"]["패치 생성"]= "done"
-    st["final_name"]= final_name
-    with open(status_file,"w") as f:
-        json.dump(st,f,indent=4)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model, cfg = load_model_for_inference(Path(args.model_path), device)
+    overlap_px = overlap_to_pixels(args.overlap_ratio, args.patch_size)
 
-    return f"Patch creation done: {final_name}"
+    results_root = output_root / "results"
+    results_root.mkdir(parents=True, exist_ok=True)
 
-@measure_time
-def step_inference(args):
-    """
-    2) 추론
-    - 이미 patch_dir/data_list.txt 존재
-    - args.model_weights => 실제 model
-    """
-    status_file= os.path.join(args.output_path, args.status_file)
-    with open(status_file,"r") as f:
-        st= json.load(f)
-
-    final_name= st.get("final_name")
-    if not final_name:
-        raise ValueError("No final_name in status. Did you run step_patch?")
-    
-    patch_dir= os.path.join(args.output_path,"patches", final_name)
-
-    data_list_path= os.path.join(patch_dir,"data_list.txt")
-    if not os.path.exists(data_list_path):
-        raise FileNotFoundError("[step_inference] data_list.txt not found")
-
-    with open(data_list_path,"r") as ff:
-        dlist= [ln.strip() for ln in ff if ln.strip()]
-    args.data_name_list= dlist
-    
-    # 실제 추론
-    _, _ = inference(args, args.multi_mode, final_name)
-
-    # status
-    st["Process"]= 70
-    st["ElapsedTime"]["추론"]= "done"
-    with open(status_file,"w") as f:
-        json.dump(st,f,indent=4)
-
-    return "Inference done"
-
-@measure_time
-def step_reconstruct(args):
-    """
-    3) 재구성
-    """
-    status_file= os.path.join(args.output_path, args.status_file)
-    with open(status_file,"r") as f:
-        st= json.load(f)
-
-    final_name= st.get("final_name")
-    if not final_name:
-        raise ValueError("no final_name in status")
-    
-    patch_dir= os.path.join(args.output_path,"patches", final_name)
-    result_dir= os.path.join(args.output_path,"results",final_name)
-    if not os.path.exists(result_dir):
-        os.makedirs(result_dir, exist_ok=True)
-
-    # reconstruct
-    _, _ = reconstruct(patch_dir, result_dir, args.multi_mode, final_name)
-
-    st["Process"]= 90
-    st["ElapsedTime"]["재구성"]= "done"
-    with open(status_file,"w") as f:
-        json.dump(st,f,indent=4)
-
-    return "Reconstruction done"
-
-@measure_time
-def step_vectorize(args):
-    """
-    4) 벡터화
-    """
-    status_file= os.path.join(args.output_path, args.status_file)
-    with open(status_file,"r") as f:
-        st= json.load(f)
-
-    final_name= st.get("final_name")
-    if not final_name:
-        raise ValueError("no final_name in status")
-
-    result_dir= os.path.join(args.output_path,"results",final_name)
-
-    # vectorize
-    _, _ = vectorize(result_dir, args.multi_mode, final_name, args.patch_size)
-
-    st["Process"]= 100
-    st["ElapsedTime"]["벡터화"]= "done"
-    with open(status_file,"w") as f:
-        json.dump(st,f, indent=4)
-
-    return "Vectorization done"
-
-def main():
-    # 1) 인자 생성
-    args = make_args().parse_args()
-    
-    args.model_weights = [os.path.join(args.model_path, pth) for pth in os.listdir(args.model_path) if pth.endswith('.pth')][0]
-
-    # make patch
-    init_infer_path = os.path.join(args.output_path,'patches')
-    init_out_path = os.path.join(args.output_path, 'results')
-    
-    init_t1_path = os.path.join(args.dataset_path, 'T1/')
-    init_t2_path = os.path.join(args.dataset_path, 'T2/')
-
-    t1_list = [file for file in os.listdir(init_t1_path) if file.endswith(".tif")]
-    t2_list = [file for file in os.listdir(init_t2_path) if file.endswith(".tif")]
-
-    if len(t1_list) != len(t2_list):
-        raise(RuntimeError("=> Please match before/after images"))
-
-    if not os.path.exists(args.output_path):
-        os.makedirs(args.output_path)
-
-    status_file = os.path.join(args.output_path, args.status_file)
-    total_step, current_step, processing = len(t1_list), 0, 0
-    # 초기화(혹은 이미 존재하면 갱신)
-    with open(status_file,"w") as f:
-        json.dump({
-            "Total_step": total_step,
-            "Current_step": current_step,
-            "Process": processing,
-            "Status": "pending",
-            "ElapsedTime":{},
-        }, f, indent=4)
-
+    final_name = None
     try:
-        for t1, t2 in zip(t1_list, t2_list):
-            t1_file = t1
-            t2_file = t2
-            # (2) final_name 생성
-            base_t1 = t1_file.replace(".tif","")
-            base_t2 = t2_file.replace(".tif","")
-            if base_t1 == base_t2:
-                final_name = base_t1
-            else:
-                final_name = f"{base_t1}_{base_t2}"
+        for img_filename in t1_files:
+            final_name = img_filename.rsplit(".", 1)[0]
+            t1_path = init_t1_path / img_filename
+            t2_path = init_t2_path / img_filename
+            result_dir = results_root / final_name
+            result_dir.mkdir(parents=True, exist_ok=True)
+            output_json_path = result_dir / f"{final_name}.json"
 
-            # (3) patch 디렉토리, result 디렉토리 경로 등 잡아주기
-            infer_dataset_path = os.path.join(init_infer_path, final_name)
-            result_saved_path = os.path.join(init_out_path, final_name)
+            update_status(
+                args.output_path,
+                args.status_file,
+                Status="in progress",
+                final_name=final_name,
+            )
 
-            with open(status_file,"r") as ff:
-                st= json.load(ff)
-            st["Status"] = 'in progress'
-            st["final_name"]= final_name
-            with open(status_file,"w") as ff:
-                json.dump(st,ff,indent=4)
+            (_, clip_window, specs), elapsed_patch = step_patch(
+                t1_path, t2_path, args.patch_size, overlap_px
+            )
+            update_status(
+                args.output_path,
+                args.status_file,
+                Process=20,
+                CurrentTask="patch done",
+                _elapsed={"패치 생성": f"{round(elapsed_patch, 2)}s"},
+            )
 
-            # (4) 패치 생성
-            if not os.path.exists(infer_dataset_path):
-                _, time_spent = step_patch(args, t1_file, t2_file, final_name)
-                with open(status_file,"r") as ff:
-                    st= json.load(ff)
-                st["ElapsedTime"]["패치 생성"]= f"{round(time_spent,2)}s"
-                st["CurrentTask"]="patch done"
-                with open(status_file,"w") as ff:
-                    json.dump(st,ff,indent=4)
+            (mask_path, _conf_path, valid_path, prob_paths), elapsed_inf = step_inference(
+                model,
+                cfg,
+                t1_path,
+                t2_path,
+                clip_window,
+                specs,
+                result_dir,
+                final_name,
+                args.batch_size,
+                args.confidence_threshold,
+                device,
+            )
+            if args.min_component_pixels > 0:
+                apply_component_filter(mask_path, args.min_component_pixels)
+            update_status(
+                args.output_path,
+                args.status_file,
+                Process=70,
+                CurrentTask="inference done",
+                _elapsed={"추론": f"{round(elapsed_inf, 2)}s"},
+            )
 
-            if not os.path.exists(result_saved_path):
-                _, time_spent= step_inference(args)
-                with open(status_file,"r") as ff:
-                    st= json.load(ff)
-                st["ElapsedTime"]["추론"]= f"{round(time_spent,2)}s"
-                st["CurrentTask"]="inference done"
-                with open(status_file,"w") as ff:
-                    json.dump(st,ff,indent=4)
+            _, elapsed_rec = step_reconstruct()
+            update_status(
+                args.output_path,
+                args.status_file,
+                Process=90,
+                CurrentTask="reconstruct done",
+                _elapsed={"재구성": f"{round(elapsed_rec, 2)}s"},
+            )
 
-            if not os.path.exists(os.path.join(result_saved_path, final_name+'.tif')):
-                _, time_spent= step_reconstruct(args)
-                with open(status_file,"r") as ff:
-                    st= json.load(ff)
-                st["ElapsedTime"]["재구성"]= f"{round(time_spent,2)}s"
-                st["CurrentTask"]="reconstruct done"
-                with open(status_file,"w") as ff:
-                    json.dump(st,ff,indent=4)
+            _, elapsed_vec = step_vectorize(
+                mask_path,
+                valid_path,
+                prob_paths,
+                output_json_path,
+                final_name,
+                args.min_area_m2,
+                args.simplify_tolerance,
+            )
+            shutil.copy2(output_json_path, output_root / output_json_path.name)
 
-            if not os.path.exists(os.path.join(result_saved_path, final_name+'.json')):
-                _, time_spent= step_vectorize(args)
-                with open(status_file,"r") as ff:
-                    st= json.load(ff)
-                st["ElapsedTime"]["벡터화"]= f"{round(time_spent,2)}s"
-                st["CurrentTask"]="vectorize done"
+            status = update_status(
+                args.output_path,
+                args.status_file,
+                Process=100,
+                Status="done",
+                CurrentTask="process completed",
+                _elapsed={"벡터화": f"{round(elapsed_vec, 2)}s"},
+            )
+            status["Current_step"] += 1
+            with open(output_root / args.status_file, "w", encoding="utf-8") as f:
+                json.dump(status, f, indent=4, ensure_ascii=False)
 
-                # done
-                st["Status"]="done"
-                st["CurrentTask"]="process completed"
-                with open(status_file,"w") as ff:
-                    json.dump(st,ff,indent=4)
+            print(f"{final_name}.tif process done", flush=True)
 
-            st["Current_step"] += 1
-            with open(status_file,"w") as ff:
-                json.dump(st,ff,indent=4)
-            print(f"{final_name}.tif process done")
+        print("=== All tasks completed ===", flush=True)
 
-        print("=== All tasks completed ===")
-    
     except Exception as ex:
-        error_message = f"Error during processing for {final_name}: {str(ex)}"
-        print(error_message)
-        log_error(os.path.join(args.output_path, "error_log.txt"), error_message)
-        with open(status_file,"r") as ff:
-            st= json.load(ff)
-        st["Status"] = 'failed'
-        with open(status_file,"w") as ff:
-            json.dump(st,ff,indent=4)
+        msg = f"Error during processing for {final_name}: {ex}"
+        print(msg, flush=True)
+        log_error(args.output_path, msg)
+        update_status(args.output_path, args.status_file, Status="failed")
+        raise
+
 
 if __name__ == "__main__":
     main()
