@@ -4,8 +4,9 @@
 cd ./innopam-PM2022004-digital/04_Building_CD
 
 # 가중치 파일 배치 (별도 전달받은 실제 파일로 교체)
-# 레포에는 같은 이름의 빈 더미 파일이 들어 있으니 덮어쓰기만 하면 됨.
-#   - workspace/model/best.pth
+# 레포에는 best.pth 이름의 빈 더미 파일이 들어 있음.
+# 추론 코드는 model 폴더의 실제(non-empty) .pth 파일 중 파일명 정렬 기준 첫 번째를 사용함.
+#   - workspace/model/*.pth
 #   - workspace/model/dinov3-vitl16-pretrain-lvd1689m/model.safetensors
 # config.json, preprocessor_config.json 은 레포에 포함됨.
 
@@ -47,7 +48,7 @@ docker-compose up
     │   └── T2
     │       └── sample.tif
     ├── model
-    │   ├── best.pth                                  # 더미 (실제 가중치로 교체)
+    │   ├── best.pth                                  # 더미 또는 실제 가중치(.pth)
     │   └── dinov3-vitl16-pretrain-lvd1689m
     │       ├── config.json
     │       ├── preprocessor_config.json
@@ -69,7 +70,8 @@ docker-compose up
 
 # 모델
 
-- `best.pth`: Building Phase 3 semantic change detector
+- `*.pth`: Building Phase 3 semantic change detector
+    - 여러 `.pth` 파일이 있으면 실제(non-empty) 파일 중 파일명 정렬 기준 첫 번째를 사용
     - DINOv3 ViT-L/16 + UPerNet
     - 최신 기준 실험: `phase3_update14_phase2init_lvd_lora_last4_rankaux_v1`
     - 지정 로그 기준 best checkpoint: epoch 17, `val_macro_change_f1=0.7167784635997279`
