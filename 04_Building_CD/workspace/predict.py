@@ -160,20 +160,19 @@ def log_error(output_path: str, message: str) -> None:
 
 
 def load_model_for_inference(model_path: Path, device: torch.device):
-    checkpoint_path = model_path / "best.pth"
-    if not checkpoint_path.exists():
+    checkpoint_candidates = sorted(
+        p for p in model_path.glob("*.pth")
+        if p.is_file() and p.stat().st_size > 0
+    )
+    if not checkpoint_candidates:
         raise FileNotFoundError(
-            f"학습 체크포인트가 없습니다: {checkpoint_path}\n"
-            "workspace/model/best.pth 파일을 실제 Building DINOv3 가중치로 교체하세요."
+            f"학습 체크포인트가 없습니다: {model_path}\n"
+            "workspace/model/ 경로에 실제 .pth 파일을 배치하세요."
         )
-    if checkpoint_path.stat().st_size == 0:
-        raise FileNotFoundError(
-            f"체크포인트가 더미 파일입니다: {checkpoint_path}\n"
-            "사용 전에 최신 Building best.pth로 덮어쓰세요."
-        )
+    checkpoint_path = checkpoint_candidates[0]
 
     ckpt_size_mb = checkpoint_path.stat().st_size / (1024 ** 2)
-    print(f"[checkpoint] best.pth: size={ckpt_size_mb:.1f} MB", flush=True)
+    print(f"[checkpoint] selected: {checkpoint_path.name}, size={ckpt_size_mb:.1f} MB", flush=True)
     state = torch.load(str(checkpoint_path), map_location="cpu")
 
     epoch = state.get("epoch", "<missing>")

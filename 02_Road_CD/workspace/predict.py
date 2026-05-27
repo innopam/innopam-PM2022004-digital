@@ -153,10 +153,10 @@ def log_error(output_path: str, message: str) -> None:
 
 
 def load_model_for_inference(model_path: Path, device: torch.device):
-    """학습 가중치(best.pth) + DINOv3 backbone(workspace/model 하위)을 로드.
+    """학습 가중치(*.pth 첫 파일) + DINOv3 backbone(workspace/model 하위)을 로드.
 
     workspace/model/
-      ├── best.pth
+      ├── *.pth
       └── dinov3-vitl16-pretrain-lvd1689m/
           ├── config.json
           ├── preprocessor_config.json
@@ -164,12 +164,17 @@ def load_model_for_inference(model_path: Path, device: torch.device):
     """
     from urban_cd.models import build_dino_upernet_change_detector
 
-    checkpoint_path = model_path / "best.pth"
-    if not checkpoint_path.exists():
+    checkpoint_candidates = sorted(
+        p for p in model_path.glob("*.pth")
+        if p.is_file() and p.stat().st_size > 0
+    )
+    if not checkpoint_candidates:
         raise FileNotFoundError(
-            f"학습 체크포인트가 없습니다: {checkpoint_path}\n"
-            f"workspace/model/best.pth 파일을 배치하세요."
+            f"학습 체크포인트가 없습니다: {model_path}\n"
+            f"workspace/model/ 경로에 실제 .pth 파일을 배치하세요."
         )
+    checkpoint_path = checkpoint_candidates[0]
+    print(f"[checkpoint] selected: {checkpoint_path.name}", flush=True)
 
     state = torch.load(str(checkpoint_path), map_location="cpu")
 
