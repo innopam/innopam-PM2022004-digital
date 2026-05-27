@@ -1,19 +1,20 @@
-# install pytorch 2.4.1
+# Base: PyTorch 2.4.1 + CUDA 12.1
 FROM pytorch/pytorch:2.4.1-cuda12.1-cudnn9-devel
 
-# Install Python packages
-RUN apt update && apt-get update
-RUN apt-get update --fix-missing
-RUN pip install --upgrade pip
-RUN printf "6\n69" | apt install -y software-properties-common
-RUN apt install -y git build-essential
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
-# Install MambaCD
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends git && \
+    rm -rf /var/lib/apt/lists/*
+
 WORKDIR /root
-RUN git clone https://github.com/innopam/MambaCD.git
-WORKDIR ./MambaCD
-RUN pip install -r requirements_api.txt
-RUN pip install -e ./kernels/selective_scan
+RUN git clone https://github.com/innopam/urban_cd_v1.git
 
-# Set Path
-ENV PYTHONPATH="/root"
+RUN pip install --upgrade pip && \
+    pip install -r /root/urban_cd_v1/requirements/infer.txt && \
+    pip install shapely tqdm
+
+ENV PYTHONPATH="/root/urban_cd_v1/common/src:/root/urban_cd_v1/building_cd/phase3_semantic_cd/src:/root/urban_cd_v1/road_cd/scripts:/root/urban_cd_v1"
