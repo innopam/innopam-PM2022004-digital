@@ -1,1121 +1,982 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
 import argparse
-import os
-import rasterio
-import numpy as np
-import rasterio.features
+import importlib.util
 import json
-import cv2
-import geopandas as gpd
 import math
-import warnings
-import onnxruntime as ort
-import networkx as nx
-import pandas as pd
+import os
+import shutil
+import sys
 import time
+import traceback
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-from more_itertools import chunked
-from multiprocessing import Pool
-from shapely.ops import unary_union
-from rasterio.windows import Window
-from shapely.geometry import shape
+import geopandas as gpd
+import numpy as np
+import pandas as pd
+import rasterio
+from rasterio.enums import Resampling
 from rasterio.features import shapes
-from rasterio.warp import transform
-from tqdm import tqdm
-
-warnings.filterwarnings("ignore", message=".*CUDAExecutionProvider.*")
-
-
-def make_args():
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument("-i", "--input", type=str, default="workspace/input", help="input folder containing T1/, T2/")
-    parser.add_argument("-m", "--model", type=str, default="workspace/model", help="Model folder containing .onnx")
-    parser.add_argument("-o", "--output", type=str, default="workspace/output", help="Output folder")
-
-    parser.add_argument("-c", "--conf-threshold", type=float, default=None)
-    parser.add_argument("-r", "--resolution", type=float, default=None)
-    parser.add_argument("--classes", type=str, default=None)
-    parser.add_argument("-t", "--max-threads", type=int, default=None)
-    parser.add_argument("-b", "--batch-size", type=int, default=8)
-
-    parser.add_argument("--cut-threshold", type=float, default=0.05)
-    parser.add_argument("--cd-threshold", type=float, default=0.7)
-
-    return parser
+from rasterio.windows import Window, from_bounds
+from shapely.geometry import GeometryCollection, MultiPolygon, Polygon, box, shape
+from shapely.ops import unary_union
 
 
-def resolve_paths(args):
-    t1_path = os.path.join(args.input, "T1")
-    t1_vec = [f for f in os.listdir(t1_path) if f.endswith(('.shp', '.geojson'))]
-    if not t1_vec:
-        raise FileNotFoundError("No vector file found in input/T1/")
-    args.prev_gdf = os.path.join(t1_path, t1_vec[0])
+APP_DIR = Path(__file__).resolve().parent
+VENDOR_DIR = APP_DIR / "vendor"
+MODEL_DIR = APP_DIR / "model"
 
-    t2_path = os.path.join(args.input, "T2")
-    t2_tifs = [f for f in os.listdir(t2_path) if f.endswith(".tif")]
-    if not t2_tifs:
-        raise FileNotFoundError("No .tif file found in input/T2/")
-    args.geotiff = os.path.join(t2_path, t2_tifs[0])
+DXF_CONVERTER = VENDOR_DIR / "dxf_to_shp.py"
+CHANGE_DETECTION_DIR = VENDOR_DIR / "change_detection"
+BUILDING_SEG_DIR = VENDOR_DIR / "building_seg"
 
-    model_files = [f for f in os.listdir(args.model) if f.endswith(".onnx")]
-    if not model_files:
-        raise FileNotFoundError("No .onnx model found in model folder")
-    args.model = os.path.join(args.model, model_files[0])
+DEFAULT_SEG_CONFIG = (
+    BUILDING_SEG_DIR
+    / "configs"
+    / "phase2_target_domain_dinov3_vitl16_lvd_lora_last4_upernet.yaml"
+)
+DEFAULT_SEG_CHECKPOINT = MODEL_DIR / "best.pth"
 
+EPSG = 5186
+DXF_BUILDING_CATEGORIES = ("기성건물", "수정도화")
+RAW_TO_ERROR_NAME = {
+    "신축": "초과 오류",
+    "소멸": "누락 오류",
+    "갱신": "묘사 오류",
+}
+ERROR_TO_ID = {
+    "초과 오류": 1,
+    "누락 오류": 2,
+    "묘사 오류": 3,
+}
+DXF_LAYER_BY_ERROR = {
+    "초과 오류": "EXCESS_ERROR",
+    "누락 오류": "MISSING_ERROR",
+    "묘사 오류": "DESCRIPTION_ERROR",
+}
+DXF_COLOR_BY_ERROR = {
+    "초과 오류": 1,
+    "누락 오류": 3,
+    "묘사 오류": 5,
+}
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Building change/error detection from one TIF and one or more DXF files"
+    )
+    parser.add_argument("--dataset_path", "--input", dest="dataset_path", type=str, default="/workspace/input")
+    parser.add_argument("--tif_path", type=str, default=None)
+    parser.add_argument(
+        "--dxf_input",
+        type=str,
+        default=None,
+        help="DXF file, DXF directory, comma-separated DXF list, or txt file with one DXF per line",
+    )
+    parser.add_argument("--output_path", "--output", dest="output_path", type=str, default="/workspace/output")
+    parser.add_argument("--model_path", "--model", dest="model_path", type=str, default="/workspace/model")
+    parser.add_argument("--epsg", type=int, default=EPSG)
+    parser.add_argument("--dxf_workers", type=int, default=0)
+    parser.add_argument("--layer_prefix", type=str, default="B")
+    parser.add_argument("--dxf_xy_tol", type=float, default=0.01)
+    parser.add_argument("--dxf_z_tol", type=float, default=1.0)
+
+    parser.add_argument("--seg_config", type=str, default=None)
+    parser.add_argument("--seg_checkpoint", type=str, default=None)
+    parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--patch_size", type=int, default=512)
+    parser.add_argument("--overlap", type=int, default=128)
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--seg_threshold", type=float, default=0.5)
+    parser.add_argument("--min_area_m2", type=float, default=10.0)
+    parser.add_argument(
+        "--result_min_area_m2",
+        type=float,
+        default=50.0,
+        help="Minimum final error polygon area in square meters. Use 0 to disable.",
+    )
+    parser.add_argument("--simplify_tolerance", type=float, default=0.15)
+    parser.add_argument("--num_preview_tiles", type=int, default=0)
+
+    parser.add_argument("--cut_threshold", type=float, default=0.05)
+    parser.add_argument("--cd_threshold", type=float, default=0.7)
+    parser.add_argument(
+        "--sheet_workers",
+        "--parallel_sheets",
+        dest="sheet_workers",
+        type=int,
+        default=3,
+        help="Number of DXF sheets to process concurrently after DXF conversion.",
+    )
+    parser.add_argument(
+        "--footprint_max_pixels",
+        type=int,
+        default=25_000_000,
+        help="Maximum pixels to read when vectorizing the TIF valid footprint",
+    )
+    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--also_geojson", action="store_true")
+    parser.add_argument(
+        "--keep_intermediate",
+        action="store_true",
+        help="Keep intermediate and report directories after successful completion.",
+    )
+    parser.add_argument(
+        "--keep_status",
+        action="store_true",
+        help="Keep status.json after successful completion.",
+    )
+    args = parser.parse_args()
+    model_root = Path(args.model_path)
+    if args.seg_config is None:
+        args.seg_config = str(model_root / "config.yaml")
+        if not Path(args.seg_config).exists():
+            args.seg_config = str(DEFAULT_SEG_CONFIG)
+    if args.seg_checkpoint is None:
+        args.seg_checkpoint = str(model_root / "best.pth")
     return args
 
 
-class ProgressBar:
-    def __init__(self):
-        self.pbar = tqdm(total=100, desc="Start")
-        self.current = 0
-        self.closed = False
-
-    def update(self, text, perc=0):
-        self.current += perc
-        self.pbar.n = int(self.current)
-        self.pbar.set_description(text)
-        self.pbar.refresh()
-
-        if self.current >= 100 and not self.closed:
-            self.pbar.set_description("End")
-            self.pbar.close()
-            self.closed = True
-
-    @staticmethod
-    def write(text):
-        tqdm.write(text)
+def log(message: str) -> None:
+    print(f"[{time.strftime('%H:%M:%S')}] {message}", flush=True)
 
 
-class StatusManager:
-    def __init__(self, dir_path="."):
-        self.filepath = os.path.join(dir_path, "status.json")
-        self.status = {
-            "CurrentTask": "init",
-            "ElapsedTime": {},
-            "Error": None
+def load_python_module(module_path: Path, module_name: str):
+    spec = importlib.util.spec_from_file_location(module_name, str(module_path))
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load module from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def normalize_path(path_text: str, base_dir: Optional[Path] = None) -> Path:
+    path = Path(path_text).expanduser()
+    if not path.is_absolute() and base_dir is not None:
+        path = base_dir / path
+    # Keep symlink paths intact. Several model/data paths in this project are
+    # symlinks, and resolving them can jump outside the mounted Docker volume.
+    return Path(os.path.abspath(os.fspath(path)))
+
+
+def resolve_tif_path(args: argparse.Namespace) -> Path:
+    if args.tif_path:
+        tif_path = normalize_path(args.tif_path)
+        if not tif_path.exists():
+            raise FileNotFoundError(f"TIF not found: {tif_path}")
+        return tif_path
+
+    dataset = normalize_path(args.dataset_path)
+    candidates: List[Path] = []
+    for subdir in ("tif", "TIF", "T2", "."):
+        root = dataset / subdir if subdir != "." else dataset
+        if root.exists():
+            candidates.extend(sorted(root.glob("*.tif")))
+            candidates.extend(sorted(root.glob("*.tiff")))
+    if not candidates:
+        raise FileNotFoundError(
+            "No TIF found. Pass --tif_path or place a .tif under dataset_path/tif."
+        )
+    return candidates[0].resolve()
+
+
+def _read_dxf_list_file(list_path: Path) -> List[Path]:
+    base = list_path.parent
+    paths = []
+    for raw in list_path.read_text(encoding="utf-8").splitlines():
+        text = raw.strip()
+        if not text or text.startswith("#"):
+            continue
+        paths.append(normalize_path(text, base))
+    return paths
+
+
+def resolve_dxf_inputs(args: argparse.Namespace) -> List[Path]:
+    if args.dxf_input:
+        text = args.dxf_input.strip()
+        if "," in text:
+            paths = [normalize_path(item.strip()) for item in text.split(",") if item.strip()]
+        else:
+            input_path = normalize_path(text)
+            if input_path.is_dir():
+                paths = sorted(input_path.glob("*.dxf"))
+            elif input_path.suffix.lower() == ".txt":
+                paths = _read_dxf_list_file(input_path)
+            else:
+                paths = [input_path]
+    else:
+        dataset = normalize_path(args.dataset_path)
+        paths = []
+        for subdir in ("dxf", "DXF", "T1"):
+            root = dataset / subdir
+            if root.exists():
+                paths.extend(sorted(root.glob("*.dxf")))
+        if not paths:
+            paths.extend(sorted(dataset.glob("*.dxf")))
+
+    missing = [str(path) for path in paths if not path.exists()]
+    if missing:
+        raise FileNotFoundError(f"DXF input not found: {missing[:5]}")
+    unique = sorted({path.resolve() for path in paths})
+    if not unique:
+        raise FileNotFoundError(
+            "No DXF found. Pass --dxf_input or place .dxf files under dataset_path/dxf."
+        )
+    return unique
+
+
+def write_status(output_dir: Path, payload: Dict[str, object]) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "status.json").write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def convert_one_dxf(task: Tuple[str, str, int, str, float, float]) -> Dict[str, object]:
+    dxf_path_text, out_dir_text, epsg, layer_prefix, xy_tol, z_tol = task
+    dxf_path = Path(dxf_path_text)
+    out_dir = Path(out_dir_text)
+    try:
+        converter = load_python_module(DXF_CONVERTER, "dxf_to_shp_worker")
+        summary = converter.convert(
+            str(dxf_path),
+            str(out_dir),
+            epsg=epsg,
+            layer_prefix=layer_prefix,
+            xy_tol=xy_tol,
+            z_tol=z_tol,
+            to_polygon=True,
+        )
+        return {
+            "ok": True,
+            "dxf_path": str(dxf_path),
+            "sheet_id": dxf_path.stem,
+            "out_dir": str(out_dir),
+            "summary": summary,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "dxf_path": str(dxf_path),
+            "sheet_id": dxf_path.stem,
+            "out_dir": str(out_dir),
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
         }
 
-    def set_task(self, task_name):
-        self.status["CurrentTask"] = task_name
-        self.save()
 
-    def record_time(self, label, seconds):
-        self.status["ElapsedTime"][label] = f"{round(seconds, 2)}s"
-        self.save()
+def run_dxf_conversion(
+    dxf_paths: Sequence[Path],
+    output_root: Path,
+    args: argparse.Namespace,
+) -> List[Dict[str, object]]:
+    raw_root = output_root / "intermediate" / "dxf_raw"
+    raw_root.mkdir(parents=True, exist_ok=True)
+    workers = args.dxf_workers
+    if workers <= 0:
+        workers = max(1, min(len(dxf_paths), os.cpu_count() or 1, 4))
+    tasks = [
+        (
+            str(path),
+            str(raw_root / path.stem),
+            int(args.epsg),
+            args.layer_prefix,
+            float(args.dxf_xy_tol),
+            float(args.dxf_z_tol),
+        )
+        for path in dxf_paths
+    ]
+    log(f"DXF conversion start: {len(tasks)} file(s), workers={workers}")
+    if workers == 1:
+        results = [convert_one_dxf(task) for task in tasks]
+    else:
+        results = []
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            future_to_task = {executor.submit(convert_one_dxf, task): task for task in tasks}
+            for future in as_completed(future_to_task):
+                results.append(future.result())
+    results.sort(key=lambda item: str(item["sheet_id"]))
+    failures = [item for item in results if not item.get("ok")]
+    if failures:
+        detail_path = output_root / "dxf_conversion_errors.json"
+        detail_path.write_text(json.dumps(failures, indent=2, ensure_ascii=False), encoding="utf-8")
+        raise RuntimeError(f"DXF conversion failed for {len(failures)} file(s): {detail_path}")
+    return results
 
-    def log_error(self, msg):
-        self.status["CurrentTask"] = "error"
-        self.status["Error"] = msg
-        self.save()
 
-    def save(self):
-        os.makedirs(os.path.dirname(self.filepath), exist_ok=True) if os.path.dirname(self.filepath) else None
-        with open(self.filepath, "w") as f:
-            json.dump(self.status, f, ensure_ascii=False, indent=4)
-
-    def task(self, name):
-        return _StatusTaskContext(self, name)
+def _category_from_shp_name(path: Path) -> Optional[str]:
+    for category in DXF_BUILDING_CATEGORIES:
+        if category in path.name:
+            return category
+    return None
 
 
-class _StatusTaskContext:
-    def __init__(self, manager, name):
-        self.manager = manager
-        self.name = name
-
-    def __enter__(self):
-        self.manager.set_task(self.name)
-        self.start = time.time()
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        elapsed = time.time() - self.start
-        self.manager.record_time(self.name, elapsed)
-        if exc_type:
-            self.manager.log_error(str(exc_val))
-
-
-def import_shapefile(file_path, crs=5186):
-    if os.path.isdir(file_path):
-        vec_files = [f for f in os.listdir(file_path) if f.endswith(('.shp', '.geojson'))]
-        if not vec_files:
-            raise FileNotFoundError(f"No .shp or .geojson file found in directory: {file_path}")
-        file_path = os.path.join(file_path, vec_files[0])  # 첫 번째 vector 파일 사용
-
-    ext = os.path.splitext(file_path)[1].lower()
-    if ext not in [".shp", ".geojson"]:
-        raise ValueError("Only .shp or .geojson")
-
-    gdf = gpd.read_file(str(file_path))
-    if gdf.crs != f"epsg:{crs}":
-        gdf = gdf.to_crs(epsg=crs)
-
+def fix_polygon_gdf(gdf: gpd.GeoDataFrame, epsg: int) -> gpd.GeoDataFrame:
+    if gdf.empty:
+        return gpd.GeoDataFrame(gdf, geometry="geometry", crs=f"EPSG:{epsg}")
+    gdf = gdf[gdf.geometry.notna()].copy()
+    gdf = gdf[~gdf.geometry.is_empty].copy()
+    if gdf.empty:
+        return gpd.GeoDataFrame(gdf, geometry="geometry", crs=f"EPSG:{epsg}")
+    if gdf.crs is None:
+        gdf = gdf.set_crs(epsg=epsg)
+    elif gdf.crs.to_epsg() != epsg:
+        gdf = gdf.to_crs(epsg=epsg)
+    try:
+        gdf.geometry = gdf.geometry.make_valid()
+    except Exception:
+        gdf.geometry = gdf.geometry.buffer(0)
+    gdf = gdf[gdf.geometry.notna()].copy()
+    gdf = gdf[~gdf.geometry.is_empty].copy()
+    gdf = gdf[gdf.geometry.geom_type.isin(["Polygon", "MultiPolygon"])].copy()
+    if not gdf.empty:
+        gdf = gdf.explode(index_parts=False, ignore_index=True)
     return gdf
 
 
-"""
-1. TIF -> 건물 추론 모델 -> GDF
-"""
+def load_converted_dxf_polygons(
+    conversion: Dict[str, object],
+    epsg: int,
+) -> gpd.GeoDataFrame:
+    out_dir = Path(str(conversion["out_dir"]))
+    dxf_path = Path(str(conversion["dxf_path"]))
+    frames = []
+    for shp_path in sorted(out_dir.glob("*_polygon.shp")):
+        category = _category_from_shp_name(shp_path)
+        if category is None:
+            continue
+        gdf = gpd.read_file(shp_path)
+        gdf = fix_polygon_gdf(gdf, epsg)
+        if gdf.empty:
+            continue
+        gdf = gdf[["geometry"]].copy()
+        gdf["DXF_CAT"] = category
+        gdf["SHEET_ID"] = dxf_path.stem
+        gdf["SRC_DXF"] = dxf_path.name
+        frames.append(gdf)
+    if not frames:
+        return gpd.GeoDataFrame(
+            {"DXF_CAT": [], "SHEET_ID": [], "SRC_DXF": []},
+            geometry=[],
+            crs=f"EPSG:{epsg}",
+        )
+    merged = pd.concat(frames, ignore_index=True)
+    return gpd.GeoDataFrame(merged, geometry="geometry", crs=f"EPSG:{epsg}")
 
 
-# 1) 모델 및 설정 불러오기
-def get_model_file(path):
-    # 모델 경로 반환
-    if os.path.isfile(path):
-        return os.path.abspath(path)
+def raster_valid_footprint(
+    tif_path: Path,
+    epsg: int,
+    max_pixels: int,
+) -> Polygon:
+    with rasterio.open(tif_path, IGNORE_COG_LAYOUT_BREAK="YES") as src:
+        if src.crs is None or src.crs.to_epsg() != epsg:
+            raise ValueError(f"TIF CRS must be EPSG:{epsg}; got {src.crs}")
+        raster_box = box(*src.bounds)
+        if src.count < 4 and src.nodata is None:
+            return raster_box
+
+        total_pixels = src.width * src.height
+        scale = max(1, int(math.ceil(math.sqrt(total_pixels / float(max_pixels)))))
+        out_width = max(1, int(math.ceil(src.width / float(scale))))
+        out_height = max(1, int(math.ceil(src.height / float(scale))))
+        mask = src.dataset_mask(out_shape=(out_height, out_width), resampling=Resampling.nearest)
+        if mask.size == 0 or int(mask.max()) == 0:
+            return GeometryCollection()
+        if int(mask.min()) > 0:
+            return raster_box
+
+        transform = src.transform * rasterio.Affine.scale(
+            src.width / float(out_width),
+            src.height / float(out_height),
+        )
+        geoms = [
+            shape(geom)
+            for geom, value in shapes(mask, mask=mask > 0, transform=transform)
+            if int(value) > 0
+        ]
+        if not geoms:
+            return GeometryCollection()
+        footprint = unary_union(geoms).intersection(raster_box)
+        if footprint.is_empty:
+            return GeometryCollection()
+        return footprint
+
+
+def geometry_to_clip_window(tif_path: Path, geom) -> Tuple[int, int, int, int]:
+    with rasterio.open(tif_path, IGNORE_COG_LAYOUT_BREAK="YES") as src:
+        minx, miny, maxx, maxy = geom.bounds
+        win = from_bounds(minx, miny, maxx, maxy, transform=src.transform)
+        col0 = max(0, int(math.floor(win.col_off)))
+        row0 = max(0, int(math.floor(win.row_off)))
+        col1 = min(src.width, int(math.ceil(win.col_off + win.width)))
+        row1 = min(src.height, int(math.ceil(win.row_off + win.height)))
+        width = max(0, col1 - col0)
+        height = max(0, row1 - row0)
+        if width <= 0 or height <= 0:
+            raise ValueError(f"Empty clip window for geometry bounds: {geom.bounds}")
+        return col0, row0, width, height
+
+
+def clip_gdf_to_geom(gdf: gpd.GeoDataFrame, geom, epsg: int) -> gpd.GeoDataFrame:
+    if gdf.empty or geom.is_empty:
+        return gpd.GeoDataFrame(gdf.iloc[0:0].copy(), geometry="geometry", crs=f"EPSG:{epsg}")
+    area = gpd.GeoDataFrame({"id": [1]}, geometry=[geom], crs=f"EPSG:{epsg}")
+    clipped = gpd.clip(gdf, area, keep_geom_type=True)
+    return fix_polygon_gdf(clipped, epsg)
+
+
+def load_building_seg_module():
+    return load_python_module(BUILDING_SEG_DIR / "scripts" / "infer_real_ortho.py", "bseg_infer")
+
+
+def load_building_seg_model(seg_module, args: argparse.Namespace):
+    import torch
+
+    config_path = normalize_path(args.seg_config)
+    checkpoint_path = normalize_path(args.seg_checkpoint)
+    if not config_path.exists():
+        raise FileNotFoundError(f"Segmentation config not found: {config_path}")
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Segmentation checkpoint not found: {checkpoint_path}")
+    device_text = args.device
+    device = torch.device(device_text if torch.cuda.is_available() or device_text == "cpu" else "cpu")
+    model, cfg = seg_module.load_model(config_path, checkpoint_path, device)
+    return model, cfg, device, config_path, checkpoint_path
+
+
+def run_segmentation_for_area(
+    seg_module,
+    model,
+    cfg: dict,
+    device,
+    tif_path: Path,
+    sheet_id: str,
+    processing_area,
+    output_root: Path,
+    args: argparse.Namespace,
+) -> gpd.GeoDataFrame:
+    clip_window = geometry_to_clip_window(tif_path, processing_area)
+    clip_x, clip_y, clip_w, clip_h = clip_window
+    seg_root = output_root / "intermediate" / "building_seg"
+    paths = seg_module.prepare_run_dir(seg_root, sheet_id, overwrite=args.overwrite)
+    specs = seg_module.build_tile_specs(clip_w, clip_h, args.patch_size, args.overlap)
+    seg_module.write_tile_index(paths["meta"] / "tile_index.csv", specs, clip_x, clip_y)
+    log(
+        f"{sheet_id}: TIF segmentation clip x={clip_x}, y={clip_y}, "
+        f"w={clip_w}, h={clip_h}, tiles={len(specs)}"
+    )
+    inference_meta = seg_module.run_inference(
+        model=model,
+        cfg=cfg,
+        image_path=tif_path,
+        paths=paths,
+        clip_x=clip_x,
+        clip_y=clip_y,
+        clip_w=clip_w,
+        clip_h=clip_h,
+        specs=specs,
+        batch_size=args.batch_size,
+        threshold=args.seg_threshold,
+        num_preview_tiles=args.num_preview_tiles,
+        device=device,
+        save_prob_float32=False,
+    )
+    vector_meta = seg_module.vectorize_outputs(
+        mask_path=Path(inference_meta["mask_path"]),
+        prob_path=Path(inference_meta["prob_path"]),
+        valid_path=Path(inference_meta["valid_path"]),
+        vector_dir=paths["vector"],
+        min_area_m2=args.min_area_m2,
+        simplify_tolerance=args.simplify_tolerance,
+    )
+    vector_path = Path(vector_meta.get("gpkg_path") or vector_meta["geojson_path"])
+    if not vector_path.exists():
+        raise FileNotFoundError(f"Segmentation vector output not found: {vector_path}")
+    tif_gdf = gpd.read_file(vector_path)
+    tif_gdf = tif_gdf.set_crs(epsg=args.epsg, allow_override=True)
+    tif_gdf = fix_polygon_gdf(tif_gdf, args.epsg)
+    tif_gdf = clip_gdf_to_geom(tif_gdf, processing_area, args.epsg)
+    tif_gdf = tif_gdf[["geometry"]].copy()
+    tif_gdf["SRC"] = "TIF"
+    tif_gdf["SHEET_ID"] = sheet_id
+    return tif_gdf
+
+
+def import_change_detection_modules():
+    if str(CHANGE_DETECTION_DIR) not in sys.path:
+        sys.path.insert(0, str(CHANGE_DETECTION_DIR))
+    from src.core.polygon_matching import polygon_matching_algorithm
+    from src.core.polygon_matching import polygon_matching_utils
+    from src.utils import analysis_utils
+
+    return polygon_matching_algorithm, polygon_matching_utils, analysis_utils
+
+
+def write_match_input(gdf: gpd.GeoDataFrame, out_dir: Path, name: str, epsg: int) -> Path:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    shp_path = out_dir / f"{name}.shp"
+    slim = gdf[["geometry"]].copy()
+    slim["SRC_ID"] = range(1, len(slim) + 1)
+    slim = gpd.GeoDataFrame(slim, geometry="geometry", crs=f"EPSG:{epsg}")
+    if slim.empty:
+        import pyogrio
+
+        pyogrio.write_dataframe(
+            slim,
+            shp_path,
+            driver="ESRI Shapefile",
+            geometry_type="Polygon",
+            encoding="UTF-8",
+        )
     else:
-        raise FileNotFoundError(f"Model file not found: {path}")
+        slim.to_file(shp_path, driver="ESRI Shapefile", encoding="utf-8")
+    return shp_path
 
 
-def create_session(model_file, max_threads=None):
-    # ONNX 모델 로드 및 config 생성
-    options = ort.SessionOptions()
-    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    options.log_severity_level = 3
-    if max_threads is not None:
-        options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-        options.intra_op_num_threads = max_threads
+def build_error_result(
+    tif_cd: gpd.GeoDataFrame,
+    dxf_cd: gpd.GeoDataFrame,
+    sheet_id: str,
+    dxf_name: str,
+    epsg: int,
+) -> gpd.GeoDataFrame:
+    frames = []
+    tif_errors = tif_cd[tif_cd["cd_class"].isin(["소멸", "갱신"])].copy()
+    if not tif_errors.empty:
+        tif_errors["SIDE"] = "TIF"
+        frames.append(tif_errors)
+    dxf_errors = dxf_cd[dxf_cd["cd_class"].isin(["신축"])].copy()
+    if not dxf_errors.empty:
+        dxf_errors["SIDE"] = "DXF"
+        frames.append(dxf_errors)
 
-    providers = [
-        'CUDAExecutionProvider',
-        'CPUExecutionProvider'
+    columns = ["CLS_ID", "CLS_NAME", "AREA", "ID", "SIDE", "SHEET_ID", "SRC_DXF", "REL_CD", "CD_RAW"]
+    if not frames:
+        return gpd.GeoDataFrame({col: [] for col in columns}, geometry=[], crs=f"EPSG:{epsg}")
+
+    result = pd.concat(frames, ignore_index=True)
+    result = gpd.GeoDataFrame(result, geometry="geometry", crs=f"EPSG:{epsg}")
+    relation_col = "Relation" if "Relation" in result.columns else "rel_cd"
+    result["CD_RAW"] = result["cd_class"]
+    result["CLS_NAME"] = result["CD_RAW"].map(RAW_TO_ERROR_NAME)
+    result = result[result["CLS_NAME"].notna()].copy()
+    result["CLS_ID"] = result["CLS_NAME"].map(ERROR_TO_ID).astype(int)
+    result["AREA"] = result.geometry.area.round(2)
+    result["SHEET_ID"] = sheet_id
+    result["SRC_DXF"] = dxf_name
+    result["REL_CD"] = result[relation_col].astype(str)
+    result["ID"] = [
+        f"{sheet_id}_{side}_{idx:06d}"
+        for idx, side in enumerate(result["SIDE"].astype(str), start=1)
     ]
-
-    session = ort.InferenceSession(model_file, sess_options=options, providers=providers)
-    inputs = session.get_inputs()
-    if len(inputs) > 1:
-        raise Exception("ONNX model: unsupported number of inputs")
-
-    meta = session.get_modelmeta().custom_metadata_map
-
-    config = {
-        'det_type': json.loads(meta.get('det_type', '"YOLO_v5_or_v7_default"')),
-        'det_conf': float(meta.get('det_conf', 0.3)),
-        'det_iou_thresh': float(meta.get('det_iou_thresh', 0.1)),
-        'classes': ['background', 'building'],
-        'seg_thresh': float(meta.get('seg_thresh', 0.5)),
-        'seg_small_segment': int(meta.get('seg_small_segment', 11)),
-        'resolution': float(20),
-        'class_names': json.loads(meta.get('class_names', '{}')),
-        'model_type': json.loads(meta.get('model_type', '"Detector"')),
-        'tiles_overlap': float(meta.get('tiles_overlap', 15)),  # percentage
-        'tiles_size': inputs[0].shape[-1],
-        'input_shape': inputs[0].shape,
-        'input_name': inputs[0].name,
-    }
-    return session, config
-
-
-def override_config(config, conf_threshold=None, resolution=None, classes=None):
-    # 사용자 입력이 있다면 우선 순위
-    if conf_threshold is not None:
-        config['det_conf'] = conf_threshold
-    if resolution is not None:
-        config['resolution'] = resolution
-    if classes is not None:
-        cn_map = cls_names_map(config['class_names'])
-        config['classes'] = [cn_map[cls_name] for cls_name in cn_map if cls_name in classes]
-    return config
-
-
-def cls_names_map(class_names):
-    # {"0": "tree"} --> {"tree": 0}
-    d = {}
-    for i in class_names:
-        d[class_names[i]] = int(i)
-    return d
-
-
-# 2) Import TIF, edit config
-def load_raster(geotiff_path: str):
-    raster = rasterio.open(geotiff_path, 'r')
-    return raster
-
-
-def get_input_resolution(raster) -> float:
-    # tif의 transform 기반 해상도 계산
-    input_res = round(max(abs(raster.transform[0]), abs(raster.transform[4])), 4) * 100
-    if input_res <= 0:
-        input_res = estimate_raster_resolution(raster)
-    return input_res
-
-
-def estimate_raster_resolution(raster):
-    # transform 정보가 없을 경우 해상도 추정
-    if raster.crs is None:
-        return 10  # Wild guess cm/px
-
-    bounds = raster.bounds
-    width = raster.width
-    height = raster.height
-    crs = raster.crs
-    res_x = (bounds.right - bounds.left) / width
-    res_y = (bounds.top - bounds.bottom) / height
-
-    if crs.is_geographic:
-        center_lat = (bounds.top + bounds.bottom) / 2
-        earth_radius = 6378137.0
-        meters_lon = math.pi / 180 * earth_radius * math.cos(math.radians(center_lat))
-        meters_lat = math.pi / 180 * earth_radius
-        res_x *= meters_lon
-        res_y *= meters_lat
-
-    return round(max(abs(res_x), abs(res_y)), 4) * 100  # cm/px
-
-
-# 3) 타일링-처리 준비
-def compute_tiling_params(raster, config, input_res):
-    # 타일 스케일 비율, 오버랩, 타일 리스트 생성
-    model_res = config['resolution']
-    scale_factor = max(1, int(model_res // input_res)) if input_res < model_res else 1
-    height, width = raster.shape
-    tiles_overlap = config['tiles_overlap'] / 100.0
-    windows = generate_for_size(width, height, config['tiles_size'] * scale_factor, tiles_overlap, clip=False)
-    return height, width, scale_factor, tiles_overlap, windows
-
-
-def generate_for_size(width, height, max_window_size, overlap_percent, clip=True):
-    # Window 생성
-    window_size_x = max_window_size
-    window_size_y = max_window_size
-
-    # If the input data is smaller than the specified window size,
-    # clip the window size to the input size on both dimensions
-    if clip:
-        window_size_x = min(window_size_x, width)
-        window_size_y = min(window_size_y, height)
-
-    # Compute the window overlap and step size
-    window_overlap_x = int(math.floor(window_size_x * overlap_percent))
-    window_overlap_y = int(math.floor(window_size_y * overlap_percent))
-    step_size_x = window_size_x - window_overlap_x
-    step_size_y = window_size_y - window_overlap_y
-
-    # Determine how many windows we will need in order to cover the input data
-    last_x = width - window_size_x
-    last_y = height - window_size_y
-    x_offsets = list(range(0, last_x + 1, step_size_x))
-    y_offsets = list(range(0, last_y + 1, step_size_y))
-
-    # Unless the input data dimensions are exact multiples of the step size,
-    # we will need one additional row and column of windows to get 100% coverage
-    if len(x_offsets) == 0 or x_offsets[-1] != last_x:
-        x_offsets.append(last_x)
-    if len(y_offsets) == 0 or y_offsets[-1] != last_y:
-        y_offsets.append(last_y)
-
-    # Generate the list of windows
-    windows = []
-    for x_offset in x_offsets:
-        for y_offset in y_offsets:
-            windows.append(Window(
-                x_offset,
-                y_offset,
-                window_size_x,
-                window_size_y,
-            ))
-
-    return windows
-
-
-def determine_indexes(raster):
-    # alpha 제거
-    indexes = raster.indexes
-    if len(indexes) > 1 and raster.colorinterp[-1] == rasterio.enums.ColorInterp.alpha:
-        indexes = indexes[:-1]
-    return indexes
-
-
-# 4) 추론, 타일 마스크 생성 및 병합
-def read_tile(args):
-    # 타일 생성
-    raster_path, window, indexes, config = args
-    with rasterio.open(raster_path) as src:
-        img = src.read(
-            indexes=indexes,
-            window=window,
-            boundless=True,
-            fill_value=0,
-            out_shape=(len(indexes), config['tiles_size'], config['tiles_size']),
-            resampling=rasterio.enums.Resampling.bilinear
-        )
-    return img
-
-
-def preprocess_batch(image_list):
-    # 배치 만들기
-    stacked = np.stack(image_list, axis=0)  # (N, C, H, W) 또는 (N, H, W, C)
-    return preprocess(stacked)
-
-
-def execute_batch_segmentation(images_batch, session, config):
-    images_batch = preprocess_batch(images_batch)
-    outs = session.run(None, {config['input_name']: images_batch})
-    final_out = outs[0][:, 0, :, :]
-    return [final_out[i] for i in range(final_out.shape[0])]
-
-
-def process_tiles(raster_path, windows, indexes, session, config, progress: ProgressBar, total_perc, batch_size):
-    n = len(windows)
-    read_perc = total_perc * 0.15
-    infer_perc = total_perc * 0.75
-    merge_perc = total_perc * 0.1
-    per_tile_merge_perc = merge_perc / n
-
-    # 타일 병렬 생성
-    progress.update("Reading tiles", read_perc)
-    args_list = [(raster_path, w, indexes, config) for w in windows]
-    with Pool() as pool:
-        tile_images = pool.map(read_tile, args_list)
-    progress.write("Completed tile reading")
-
-    # 추론
-    tile_masks = []
-    total_batches = len(tile_images) // batch_size + int(len(tile_images) % batch_size != 0)
-    per_batch_perc = infer_perc / total_batches
-
-    for i, batch in enumerate(chunked(tile_images, batch_size)):
-        progress.update(f"Inference batch {i+1}/{total_batches}", perc=per_batch_perc)
-        batch_masks = execute_batch_segmentation(batch, session, config)  # List[(H, W)]
-        tile_masks.extend(batch_masks)
-    progress.write(f"Completed inference")
-
-    with rasterio.open(raster_path) as src:
-        height, width = src.shape
-        input_res = round(max(abs(src.transform[0]), abs(src.transform[4])), 4) * 100
-    model_res = config['resolution']
-    scale_factor = max(1, int(model_res // input_res)) if input_res < model_res else 1
-    tiles_overlap = config['tiles_overlap'] / 100.0
-    mask = np.zeros((height // scale_factor, width // scale_factor), dtype=np.uint8)
-
-    for idx, w in enumerate(windows):
-        progress.update(f"Merging tile {idx+1}/{n}", perc=per_tile_merge_perc)
-        merge_mask(tile_masks[idx], mask, w, width, height, tiles_overlap, scale_factor)
-    return mask
-
-
-def preprocess(model_input):
-    # 채널 정렬, 정규화
-    s = model_input.shape
-    if not len(s) in [3, 4]:
-        raise Exception(f"Expected input with 3 or 4 dimensions, got: {s}")
-    is_batched = len(s) == 4
-
-    # expected: [batch],channel,height,width but could be: [batch],height,width,channel
-    if s[-1] in [3, 4] and s[1] > s[-1]:
-        if is_batched:
-            model_input = np.transpose(model_input, (0, 3, 1, 2))
-        else:
-            model_input = np.transpose(model_input, (2, 0, 1))
-
-    # add batch dimension (1, c, h, w)
-    if not is_batched:
-        model_input = np.expand_dims(model_input, axis=0)
-
-    # drop alpha channel
-    if model_input.shape[1] == 4:
-        model_input = model_input[:, 0:3, :, :]
-
-    if model_input.shape[1] != 3:
-        raise Exception(f"Expected input channels to be 3, but got: {model_input.shape[1]}")
-
-    # normalize
-    if model_input.dtype == np.uint8:
-        return (model_input / 255.0).astype(np.float32)
-
-    if model_input.dtype.kind == 'f':
-        min_value = float(model_input.min())
-        value_range = float(model_input.max()) - min_value
-    else:
-        data_range = np.iinfo(model_input.dtype)
-        min_value = 0
-        value_range = float(data_range.max) - float(data_range.min)
-
-    model_input = model_input.astype(np.float32)
-    model_input -= min_value
-    model_input /= value_range
-    model_input[model_input > 1] = 1
-    model_input[model_input < 0] = 0
-
-    return model_input
-
-
-# 5) 마스크 후처리
-def merge_mask(tile_mask, mask, window, width, height, tiles_overlap=0, scale_factor=1.0):
-    # 오버랩 계산하여 마스크 병합
-    w = window
-    row_off = int(w.row_off // scale_factor)  # int(np.round(w.row_off / scale_factor))
-    col_off = int(w.col_off // scale_factor)  # int(np.round(w.col_off / scale_factor))
-    tile_w, tile_h = tile_mask.shape
-
-    pad_x = int(tiles_overlap * tile_w) // 2
-    pad_y = int(tiles_overlap * tile_h) // 2
-
-    pad_l = 0
-    pad_r = 0
-    pad_t = 0
-    pad_b = 0
-
-    if w.col_off > 0:
-        pad_l = pad_x
-    if w.col_off + w.width < width:
-        pad_r = pad_x
-    if w.row_off > 0:
-        pad_t = pad_y
-    if w.row_off + w.height < height:
-        pad_b = pad_y
-
-    row_off += pad_t
-    col_off += pad_l
-    tile_w -= pad_l + pad_r
-    tile_h -= pad_t + pad_b
-
-    tile_mask = tile_mask[np.newaxis, :, :]  # shape: (1, 512, 512)
-    tile_mask = tile_mask[:, pad_t:pad_t + tile_h, pad_l:pad_l + tile_w]
-    tr, sr = rect_intersect((col_off, row_off, tile_w, tile_h), (0, 0, mask.shape[1], mask.shape[0]))
-    if tr is not None and sr is not None:
-        mask[sr[1]:sr[1] + sr[3], sr[0]:sr[0] + sr[2]] = tile_mask[:, tr[1]:tr[1] + tr[3], tr[0]:tr[0] + tr[2]]
-        # mask[sr[1]:sr[1]+sr[3], sr[0]:sr[0]+sr[2]] *= (idx + 1)
-
-
-def rect_intersect(rect1, rect2):
-    """
-    Given two rectangles, compute the intersection rectangle and return
-    its coordinates in the coordinate system of both rectangles.
-
-    Each rectangle is represented as (x, y, width, height).
-
-    Returns:
-    - (r1_x, r1_y, iw, ih): Intersection in rect1's local coordinates
-    - (r2_x, r2_y, iw, ih): Intersection in rect2's local coordinates
-    """
-    x1, y1, w1, h1 = rect1
-    x2, y2, w2, h2 = rect2
-
-    ix = max(x1, x2)  # Left boundary
-    iy = max(y1, y2)  # Top boundary
-    ix2 = min(x1 + w1, x2 + w2)  # Right boundary
-    iy2 = min(y1 + h1, y2 + h2)  # Bottom boundary
-
-    # Compute intersection
-    iw = max(0, ix2 - ix)
-    ih = max(0, iy2 - iy)
-
-    # If no intersection
-    if iw == 0 or ih == 0:
-        return None, None
-
-    # Compute local coordinates
-    r1_x = ix - x1
-    r1_y = iy - y1
-    r2_x = ix - x2
-    r2_y = iy - y2
-
-    return (r1_x, r1_y, iw, ih), (r2_x, r2_y, iw, ih)
-
-
-try:
-    from scipy.ndimage import median_filter
-except ImportError:
-    def median_filter(arr, size=5):
-        assert size % 2 == 1, "Kernel size must be an odd number."
-        if arr.shape[0] <= size or arr.shape[1] <= size:
-            return arr
-
-        pad_size = size // 2
-        padded = np.pad(arr, pad_size, mode='edge')
-        shape = (arr.shape[0], arr.shape[1], size, size)
-        strides = padded.strides + padded.strides
-        view = np.lib.stride_tricks.as_strided(padded, shape=shape, strides=strides)
-        return np.median(view, axis=(2, 3)).astype(arr.dtype)
-
-
-def filter_small_segments(mask, config):
-    # Better matches the logic from Deepness
-    # where the parameter refers to the dilation/erode size
-    # (sieve counts the number of pixels)
-    ss = (config['seg_small_segment'] * 2) ** 2
-    if ss > 0:
-        # Remove small polygons
-        rasterio.features.sieve(mask, ss, out=mask)
-    return mask
-
-
-def morphology_to_mask(mask, open_k=21, close_k=3, iterations=2):
-    open_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (open_k, open_k))
-    close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (close_k, close_k))
-
-    opened = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_kernel, iterations=iterations)
-    morphed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, close_kernel, iterations=iterations)
-    return morphed
-
-
-# 6) GDF 변환 및 후처리
-def mask_to_gdf(raster, mask, config, scale_factor=1.0):
-    affine = raster.transform * rasterio.Affine.scale(scale_factor, scale_factor)
-
-    values = np.unique(mask)
-    values = values[values != 0]
-
-    target_value = values[0]
-
-    geometries = []
-    for geom, val in shapes(source=mask, mask=(mask == target_value), transform=affine):
-        s = shape(geom)
-        if s.is_valid and not s.is_empty:
-            xs, ys = zip(*s.exterior.coords[:])
-            x_new, y_new = transform(raster.crs, "EPSG:5186", xs, ys)
-            projected_geom = shape({
-                "type": "Polygon",
-                "coordinates": [list(zip(x_new, y_new))]
-            })
-            geometries.append(projected_geom)
-
-    return gpd.GeoDataFrame({'class': ['building'] * len(geometries), 'geometry': geometries}, crs="EPSG:5186")
-
-
-def simplify_polygon(polygon, tolerance=1.0, preserve_topology=True):
-    return polygon.simplify(tolerance, preserve_topology)
-
-
-"""
-2. Inference GDF, prev GDF -> 변화탐지 -> Inference result, prev result 
-"""
-
-
-# 1) 매칭 전처리
-def indexing(poly1, poly2):
-    # 고유 인덱스, 면적, spatial join
-    poly1['poly1_idx'] = range(1, len(poly1) + 1)
-    poly1 = poly1.reset_index(drop=True)
-
-    poly2['poly2_idx'] = range(1, len(poly2) + 1)
-    poly2 = poly2.reset_index(drop=True)
-
-    poly1_area = poly1.geometry.area
-    poly2_area = poly2.geometry.area
-
-    poly1 = poly1.drop(columns=['area'], errors='ignore')
-    idx_loc1 = poly1.columns.get_loc('poly1_idx')
-    poly1.insert(loc=idx_loc1, column='area', value=poly1_area)
-
-    poly2 = poly2.drop(columns=['area'], errors='ignore')
-    idx_loc2 = poly2.columns.get_loc('poly2_idx')
-    poly2.insert(loc=idx_loc2, column='area', value=poly2_area)
-
-    outer_joined = outer_join(poly1, poly2, poly1_prefix="poly1", poly2_prefix="poly2")
-    return poly1, poly2, outer_joined
-
-
-def outer_join(poly1, poly2, poly1_prefix="poly1", poly2_prefix="poly2"):
-    left_join = gpd.sjoin(poly1, poly2, how='left', predicate='intersects')
-    right_join = gpd.sjoin(poly2, poly1, how='left', predicate='intersects')
-    left_join.columns = [
-        col.replace('_left', '_poly1').replace('_right', '_poly2')
-        for col in left_join.columns
-    ]
-
-    right_join.columns = [
-        col.replace('_left', '_poly2').replace('_right', '_poly1')
-        for col in right_join.columns
-    ]
-
-    joined = pd.merge(left_join, right_join, how='outer', on=list(set(left_join.columns) & set(right_join.columns)))
-    subset_cols = [f"{poly1_prefix}_idx", f"{poly2_prefix}_idx"]
-    joined = joined.drop_duplicates(subset=subset_cols)
-    joined = joined.reset_index(drop=True)
-    return joined
-
-
-# 2) 그래프 구성 및 정제
-def build_graph(joined_df):
-    # 공간적으로 매칭된 poly1, poly2 쌍으로부터 노드-링크 구조의 관계 그래프 생성
-    nodes = set()
-    links = []
-
-    for _, row in joined_df.dropna(subset=["poly1_idx", "poly2_idx"]).iterrows():
-        p1 = f"p1_{int(row['poly1_idx'])}"
-        p2 = f"p2_{int(row['poly2_idx'])}"
-        links.append({"source": p1, "target": p2})
-        nodes.update([p1, p2])
-
-    if "poly1_idx" in joined_df.columns:
-        for p1 in joined_df["poly1_idx"].dropna().unique():
-            nodes.add(f"p1_{int(p1)}")
-    if "poly2_idx" in joined_df.columns:
-        for p2 in joined_df["poly2_idx"].dropna().unique():
-            nodes.add(f"p2_{int(p2)}")
-
-    node_list = [{"id": n} for n in sorted(nodes)]
-
-    return {"nodes": node_list, "links": links}
-
-
-def add_energy_to_links(poly1, poly2, graph_dict):
-    # 각 링크에 대해 IoU 계산
-    poly1 = poly1.set_index("poly1_idx")
-    poly2 = poly2.set_index("poly2_idx")
-
-    for link in graph_dict["links"]:
-        p1_idx = int(link["source"].replace("p1_", ""))
-        p2_idx = int(link["target"].replace("p2_", ""))
-
-        if p1_idx not in poly1.index or p2_idx not in poly2.index:
-            raise ValueError(f"Missing poly1_idx {p1_idx} or poly2_idx {p2_idx} in geometry.")
-
-        geom1 = poly1.loc[p1_idx, "geometry"]
-        geom2 = poly2.loc[p2_idx, "geometry"]
-
-        if geom1.is_empty or geom2.is_empty:
-            raise ValueError(f"Empty geometry at poly1_idx {p1_idx} or poly2_idx {p2_idx}.")
-
-        intersection = geom1.intersection(geom2)
-        union = geom1.union(geom2)
-
-        if union.area == 0 or intersection.area == 0:
-            raise ValueError(f"No valid overlap between {p1_idx} and {p2_idx}.")
-
-        link["energy"] = intersection.area / union.area
-
-    return graph_dict
-
-
-def split_graph_by_energy(poly1, poly2, graph_dict, threshold):
-    # energy(IoU)가 낮은 링크 끊고 component 및 link 재구성
-    poly1 = poly1.set_index("poly1_idx")
-    poly2 = poly2.set_index("poly2_idx")
-
-    G = nx.Graph()
-    original_links = graph_dict["links"]
-    original_nodes = graph_dict["nodes"]
-
-    cut_links = []
-    kept_links = []
-
-    suppression = 0.7
-
-    for link in original_links:
-        energy = link.get("energy", 0)
-
-        if energy >= threshold:
-            G.add_edge(link["source"], link["target"], energy=energy)
-            kept_links.append(link)
-        else:
-            p1_idx = int(link["source"].replace("p1_", ""))
-            p2_idx = int(link["target"].replace("p2_", ""))
-            geom1 = poly1.loc[p1_idx, "geometry"]
-            geom2 = poly2.loc[p2_idx, "geometry"]
-            area1 = poly1.loc[p1_idx, "area"]
-
-            intersection = geom1.intersection(geom2)
-            ol1 = intersection.area / area1 if area1 > 0 else 0
-
-            if ol1 < suppression:
-                cut_links.append(link)
-            else:
-                G.add_edge(link["source"], link["target"], energy=energy)
-                kept_links.append(link)
-
-    for node in original_nodes:
-        G.add_node(node["id"])
-
-    components_dict = {}
-    new_node_list = []
-    new_link_list = []
-
-    for comp_idx, comp in enumerate(nx.connected_components(G)):
-        poly1_set = sorted(int(n[3:]) for n in comp if n.startswith("p1_"))
-        poly2_set = sorted(int(n[3:]) for n in comp if n.startswith("p2_"))
-
-        components_dict[comp_idx] = {
-            "poly1_set": poly1_set,
-            "poly2_set": poly2_set
-        }
-
-        for n in comp:
-            new_node_list.append({"id": n, "comp_idx": comp_idx})
-
-        for u, v in G.subgraph(comp).edges:
-            source, target = (u, v) if u.startswith("p1_") else (v, u)
-            new_link_list.append({
-                "source": source,
-                "target": target,
-                "comp_idx": comp_idx,
-                "energy": G[source][target]["energy"]
-            })
-
-    summary = {
-        "after_components": len(components_dict),
-        "num_cut_links": len(cut_links)
-    }
-    return components_dict, {"nodes": new_node_list, "links": new_link_list}, cut_links, summary
-
-
-# 3) 그래프 기반 정량 지표 계산
-def mark_cut_links(poly1, poly2, cut_links):
-    # link 제거 정보 기록
-    cut_poly1_idxs = set(
-        int(link["source"].replace("p1_", "")) for link in cut_links if link["source"].startswith("p1_"))
-    cut_poly2_idxs = set(
-        int(link["target"].replace("p2_", "")) for link in cut_links if link["target"].startswith("p2_"))
-
-    poly1 = poly1.copy()
-    poly2 = poly2.copy()
-
-    poly1["cut_link"] = poly1["poly1_idx"].isin(cut_poly1_idxs)
-    poly2["cut_link"] = poly2["poly2_idx"].isin(cut_poly2_idxs)
-
-    return poly1, poly2
-
-
-def attach_metrics_from_components(components_dict, poly1, poly2):
-    # Relation, IoU, Overlap1,2 유형별 기록
-    poly1 = poly1.copy()
-    poly2 = poly2.copy()
-
-    # 초기화
-    metric_cols = [
-        "comp_idx", "Relation",
-        "iou_1n", "ol_pl1_1n", "ol_pl2_1n",
-        "iou_n1", "ol_pl1_n1", "ol_pl2_n1",
-        "iou_11", "ol_pl1_11", "ol_pl2_11",
-        "iou_nn", "ol_pl1_nn", "ol_pl2_nn"
-    ]
-    for col in metric_cols[2:]:
-        poly1[col] = np.nan
-        poly2[col] = np.nan
-    poly1["comp_idx"] = np.nan
-    poly2["comp_idx"] = np.nan
-    poly1["Relation"] = np.nan
-    poly2["Relation"] = np.nan
-
-    def calc_metrics(g1, g2):
-        if g1 is None or g2 is None:
-            return (np.nan, np.nan, np.nan)
-        inter = g1.intersection(g2).area
-        if inter == 0:
-            return (0, 0, 0)
-        return (
-            inter / g1.union(g2).area,
-            inter / g1.area if g1.area > 0 else 0,
-            inter / g2.area if g2.area > 0 else 0
-        )
-
-    for comp_idx, comp in components_dict.items():
-        p1_set = comp["poly1_set"]
-        p2_set = comp["poly2_set"]
-
-        rel = (
-            "1:0" if len(p2_set) == 0 else
-            "0:1" if len(p1_set) == 0 else
-            "1:1" if len(p1_set) == 1 and len(p2_set) == 1 else
-            "1:N" if len(p1_set) == 1 else
-            "N:1" if len(p2_set) == 1 else "N:N"
-        )
-
-        poly1["Relation"] = poly1["Relation"].astype("object")
-        poly2["Relation"] = poly2["Relation"].astype("object")
-
-        poly1.loc[poly1['poly1_idx'].isin(p1_set), ["comp_idx", "Relation"]] = [comp_idx, rel]
-        poly2.loc[poly2['poly2_idx'].isin(p2_set), ["comp_idx", "Relation"]] = [comp_idx, rel]
-
-        if rel == "1:N":
-            g1 = poly1.loc[poly1['poly1_idx'] == p1_set[0], "geometry"].values[0]
-            g2_union = unary_union(poly2.loc[poly2['poly2_idx'].isin(p2_set), "geometry"])
-
-            # n1: poly1 vs union(poly2)
-            iou_n1, ol1_n1, ol2_n1 = calc_metrics(g1, g2_union)
-            poly1.loc[poly1['poly1_idx'] == p1_set[0], ["iou_n1", "ol_pl1_n1", "ol_pl2_n1"]] = [iou_n1, ol1_n1, ol2_n1]
-            poly2.loc[poly2['poly2_idx'].isin(p2_set), ["iou_n1", "ol_pl1_n1", "ol_pl2_n1"]] = [iou_n1, ol1_n1, ol2_n1]
-
-            # nn: poly1 vs each poly2
-            for p2 in p2_set:
-                g2 = poly2.loc[poly2['poly2_idx'] == p2, "geometry"].values[0]
-                iou, ol1, ol2 = calc_metrics(g1, g2)
-                poly2.loc[poly2['poly2_idx'] == p2, ["iou_nn", "ol_pl1_nn", "ol_pl2_nn"]] = [iou, ol1, ol2]
-            poly1.loc[poly1['poly1_idx'] == p1_set[0], ["iou_nn", "ol_pl1_nn", "ol_pl2_nn"]] = [iou, ol1, ol2]
-
-        elif rel == "N:1":
-            g2 = poly2.loc[poly2['poly2_idx'] == p2_set[0], "geometry"].values[0]
-            g1_union = unary_union(poly1.loc[poly1['poly1_idx'].isin(p1_set), "geometry"])
-
-            # 1n: union(poly1) vs poly2
-            iou_1n, ol1_1n, ol2_1n = calc_metrics(g1_union, g2)
-            poly1.loc[poly1['poly1_idx'].isin(p1_set), ["iou_1n", "ol_pl1_1n", "ol_pl2_1n"]] = [iou_1n, ol1_1n, ol2_1n]
-            poly2.loc[poly2['poly2_idx'] == p2_set[0], ["iou_1n", "ol_pl1_1n", "ol_pl2_1n"]] = [iou_1n, ol1_1n, ol2_1n]
-
-            # nn: each poly1 vs poly2
-            for p1 in p1_set:
-                g1 = poly1.loc[poly1['poly1_idx'] == p1, "geometry"].values[0]
-                iou, ol1, ol2 = calc_metrics(g1, g2)
-                poly1.loc[poly1['poly1_idx'] == p1, ["iou_nn", "ol_pl1_nn", "ol_pl2_nn"]] = [iou, ol1, ol2]
-            poly2.loc[poly2['poly2_idx'] == p2_set[0], ["iou_nn", "ol_pl1_nn", "ol_pl2_nn"]] = [iou, ol1, ol2]
-
-        elif rel == "N:N":
-            g1_union = unary_union(poly1.loc[poly1['poly1_idx'].isin(p1_set), "geometry"])
-            g2_union = unary_union(poly2.loc[poly2['poly2_idx'].isin(p2_set), "geometry"])
-
-            # 11: union vs union
-            iou_11, ol1_11, ol2_11 = calc_metrics(g1_union, g2_union)
-            poly1.loc[poly1['poly1_idx'].isin(p1_set), ["iou_11", "ol_pl1_11", "ol_pl2_11"]] = [iou_11, ol1_11, ol2_11]
-            poly2.loc[poly2['poly2_idx'].isin(p2_set), ["iou_11", "ol_pl1_11", "ol_pl2_11"]] = [iou_11, ol1_11, ol2_11]
-
-            # 1n: union(poly1) vs each poly2
-            for p2 in p2_set:
-                g2 = poly2.loc[poly2['poly2_idx'] == p2, "geometry"].values[0]
-                iou, ol1, ol2 = calc_metrics(g1_union, g2)
-                poly2.loc[poly2['poly2_idx'] == p2, ["iou_1n", "ol_pl1_1n", "ol_pl2_1n"]] = [iou, ol1, ol2]
-            poly1.loc[poly1['poly1_idx'].isin(p1_set), ["iou_1n", "ol_pl1_1n", "ol_pl2_1n"]] = [iou, ol1, ol2]
-
-            # n1: each poly1 vs union(poly2)
-            for p1 in p1_set:
-                g1 = poly1.loc[poly1['poly1_idx'] == p1, "geometry"].values[0]
-                iou, ol1, ol2 = calc_metrics(g1, g2_union)
-                poly1.loc[poly1['poly1_idx'] == p1, ["iou_n1", "ol_pl1_n1", "ol_pl2_n1"]] = [iou, ol1, ol2]
-            poly2.loc[poly2['poly2_idx'].isin(p2_set), ["iou_n1", "ol_pl1_n1", "ol_pl2_n1"]] = [iou, ol1, ol2]
-
-        elif rel == "1:1":
-            p1 = p1_set[0]
-            p2 = p2_set[0]
-            g1 = poly1.loc[poly1['poly1_idx'] == p1, "geometry"].values[0]
-            g2 = poly2.loc[poly2['poly2_idx'] == p2, "geometry"].values[0]
-            iou, ol1, ol2 = calc_metrics(g1, g2)
-            poly1.loc[poly1['poly1_idx'] == p1, ["iou_nn", "ol_pl1_nn", "ol_pl2_nn"]] = [iou, ol1, ol2]
-            poly2.loc[poly2['poly2_idx'] == p2, ["iou_nn", "ol_pl1_nn", "ol_pl2_nn"]] = [iou, ol1, ol2]
-
-    return poly1, poly2
-
-
-def add_component_sets_to_polys(poly1, poly2, components_dict):
-    # 각 폴리곤에 본인이 속한 component, 관계가 있는 다른 폴리곤 기록
-    poly1 = poly1.copy()
-    poly2 = poly2.copy()
-
-    # 새로운 열 초기화
-    poly1['poly1_set'] = None
-    poly1['poly2_set'] = None
-    poly2['poly1_set'] = None
-    poly2['poly2_set'] = None
-
-    # poly1에 붙이기
-    for idx, row in poly1.iterrows():
-        p1_id = row['poly1_idx']
-        for comp in components_dict.values():
-            if p1_id in comp['poly1_set']:
-                poly1.at[idx, 'poly1_set'] = comp['poly1_set']
-                poly1.at[idx, 'poly2_set'] = comp['poly2_set']
-                break  # 하나의 component만 매칭되므로 break
-
-    # poly2에 붙이기
-    for idx, row in poly2.iterrows():
-        p2_id = row['poly2_idx']
-        for comp in components_dict.values():
-            if p2_id in comp['poly2_set']:
-                poly2.at[idx, 'poly1_set'] = comp['poly1_set']
-                poly2.at[idx, 'poly2_set'] = comp['poly2_set']
-                break
-
-    # 열 순서 정리: comp_idx 다음에 poly1_set, poly2_set 붙이기
-    def insert_after(df, after_col, insert_cols):
-        cols = df.columns.tolist()
-        idx = cols.index(after_col) + 1
-        for col in insert_cols:
-            if col in cols:
-                cols.remove(col)
-        for i, col in enumerate(insert_cols):
-            cols.insert(idx + i, col)
-        return df[cols]
-
-    poly1 = insert_after(poly1, 'comp_idx', ['poly1_set', 'poly2_set'])
-    poly2 = insert_after(poly2, 'comp_idx', ['poly1_set', 'poly2_set'])
-
-    return poly1, poly2
-
-
-# 4) 변화 유형 분류
-def assign_class(poly, threshold):
-    poly = assign_cd_class(poly, threshold, "cd")
-    poly = assign_class_10(poly, "cd")
-
-    return poly
-
-
-def assign_cd_class(poly, threshold, prefix="cd"):
-    # IoU 및 Relation 기반 신축, 소멸, 변화없음, 갱신 판별
-    class_col_name = f"{prefix}_class"  # 자동으로 열 이름 생성
-
-    cd_class = np.full(len(poly), np.nan, dtype=object)
-
-    cd_class[np.where(poly['Relation'] == '0:1')[0]] = '신축'
-    cd_class[np.where(poly['Relation'] == '1:0')[0]] = '소멸'
-
-    cd_class[np.where((poly['Relation'] == '1:1') & (poly['iou_nn'] > threshold))[0]] = '변화없음'
-    cd_class[np.where((poly['Relation'] == '1:1') & (poly['iou_nn'] <= threshold))[0]] = '갱신'
-
-    cd_class[np.where((poly['Relation'] == '1:N') & (poly['iou_n1'] > threshold))[0]] = '변화없음'
-    cd_class[np.where((poly['Relation'] == '1:N') & (poly['iou_n1'] <= threshold))[0]] = '갱신'
-
-    cd_class[np.where((poly['Relation'] == 'N:1') & (poly['iou_1n'] > threshold))[0]] = '변화없음'
-    cd_class[np.where((poly['Relation'] == 'N:1') & (poly['iou_1n'] <= threshold))[0]] = '갱신'
-
-    cd_class[np.where((poly['Relation'] == 'N:N') & (poly['iou_11'] > threshold))[0]] = '변화없음'
-    cd_class[np.where((poly['Relation'] == 'N:N') & (poly['iou_11'] <= threshold))[0]] = '갱신'
-
-    if class_col_name in poly.columns:
-        poly = poly.drop(columns=[class_col_name])
-
-    relation_loc = poly.columns.get_loc('Relation')
-    poly.insert(loc=relation_loc + 1, column=class_col_name, value=cd_class)
-
-    return poly
-
-
-def assign_class_10(poly, prefix="cd"):
-    # 10가지 클래스 생성
-    class_col = f"{prefix}_class"
-    class10_col = "class_10"
-
-    def get_class(row):
-        rel = row.get("Relation")
-        cls = row.get(class_col)
-
-        if rel == "1:0" and cls == "소멸":
-            return "소멸"
-        elif rel == "0:1" and cls == "신축":
-            return "신축"
-        elif rel == "1:1" and cls == "갱신":
-            return "1:1 갱신"
-        elif rel == "1:1" and cls == "변화없음":
-            return "1:1 변화없음"
-        elif rel == "1:N" and cls == "변화없음":
-            return "1:N 변화없음"
-        elif rel == "1:N" and cls == "갱신":
-            return "1:N 갱신"
-        elif rel == "N:1" and cls == "변화없음":
-            return "N:1 변화없음"
-        elif rel == "N:1" and cls == "갱신":
-            return "N:1 갱신"
-        elif rel == "N:N" and cls == "변화없음":
-            return "N:N 변화없음"
-        elif rel == "N:N" and cls == "갱신":
-            return "N:N 갱신"
-        else:
-            return None  # 기타 처리 안 된 경우
-
-    poly = poly.copy()
-    poly[class10_col] = poly.apply(get_class, axis=1)
-
-    relation_loc = poly.columns.get_loc("Relation")
-    reordered = poly.pop(class10_col)
-    poly.insert(loc=relation_loc + 1, column=class10_col, value=reordered)
-
-    return poly
-
-
-def cd_pipeline(dmap, seg, cd_threshold):
-    dmap = assign_class(dmap, cd_threshold)
-    seg = assign_class(seg, cd_threshold)
-    dmap = dmap.rename(columns={"Relation": "rel_cd"})
-    seg = seg.rename(columns={"Relation": "rel_cd"})
-    result = pd.concat([dmap, seg[seg['cd_class'] == '신축']],
-                       ignore_index=True)
-    cd_class_map = {'변화없음': 0, '신축': 1, '소멸': 2, '갱신': 3}
-
-    result = result.copy()
-    result['CLS_NAME'] = result['cd_class']
-    result['CLS_ID'] = result['CLS_NAME'].map(cd_class_map)
-    result['AREA'] = result['geometry'].area.round(2)
-
-    # 필요한 컬럼만 남기기
-    result['ID'] = result.apply(
-        lambda row: f"p_{int(row['poly1_idx'])}" if not pd.isna(row.get('poly1_idx')) else f"c_{int(row['poly2_idx'])}",
-        axis=1
+    result = result[columns + ["geometry"]].copy()
+    return gpd.GeoDataFrame(result, geometry="geometry", crs=f"EPSG:{epsg}")
+
+
+def filter_result_by_area(
+    result: gpd.GeoDataFrame,
+    min_area_m2: float,
+    epsg: int,
+) -> gpd.GeoDataFrame:
+    if result.empty:
+        return gpd.GeoDataFrame(result, geometry="geometry", crs=f"EPSG:{epsg}")
+    filtered = result.copy()
+    filtered["AREA"] = filtered.geometry.area.round(2)
+    if min_area_m2 > 0:
+        filtered = filtered[filtered["AREA"] >= float(min_area_m2)].copy()
+    return gpd.GeoDataFrame(filtered, geometry="geometry", crs=f"EPSG:{epsg}")
+
+
+def write_empty_shapefile(shp_path: Path, epsg: int) -> None:
+    import pyogrio
+
+    shp_path.parent.mkdir(parents=True, exist_ok=True)
+    empty = gpd.GeoDataFrame(
+        {
+            "CLS_ID": pd.Series(dtype="int64"),
+            "CLS_NAME": pd.Series(dtype="object"),
+            "AREA": pd.Series(dtype="float64"),
+            "ID": pd.Series(dtype="object"),
+            "SIDE": pd.Series(dtype="object"),
+            "SHEET_ID": pd.Series(dtype="object"),
+            "SRC_DXF": pd.Series(dtype="object"),
+            "REL_CD": pd.Series(dtype="object"),
+            "CD_RAW": pd.Series(dtype="object"),
+        },
+        geometry=[],
+        crs=f"EPSG:{epsg}",
+    )
+    pyogrio.write_dataframe(
+        empty,
+        shp_path,
+        driver="ESRI Shapefile",
+        geometry_type="Polygon",
+        encoding="UTF-8",
     )
 
-    # 필요한 컬럼만 정리
-    result = result[['CLS_ID', 'CLS_NAME', 'AREA', 'ID', 'geometry']]
-    return result
+
+def iter_polygon_parts(geom) -> Iterable[Polygon]:
+    if geom is None or geom.is_empty:
+        return
+    if isinstance(geom, Polygon):
+        yield geom
+    elif isinstance(geom, MultiPolygon):
+        for part in geom.geoms:
+            if not part.is_empty:
+                yield part
 
 
-def main():
-    args = make_args().parse_args()
-    progress = ProgressBar()
-    status = StatusManager(args.output)
-    with status.task("Loading input files"):
-        args = resolve_paths(args)
+def export_result_dxf(gdf: gpd.GeoDataFrame, dxf_path: Path) -> None:
+    import ezdxf
 
-    # 건물 추론 시작
-    with status.task("Loading ONNX Model"):
-        progress.write("Start Building Segmentation")
-        # 모델 및 설정 불러오기
-        progress.update("Loading ONNX Model", perc=5)
-        session, config = create_session(get_model_file(args.model), max_threads=args.max_threads)
-        config = override_config(
-            config,
-            conf_threshold=args.conf_threshold,
-            resolution=args.resolution,
-            classes=args.classes
-        )
-        progress.write("Completed Load Model")
-    # 영상 데이터, 해상도 설정
-    with status.task("Loading GeoTIFF"):
-        progress.update("Loading GeoTIFF", perc=5)
-        raster = load_raster(args.geotiff)
-        progress.write("Completed Load GeoTIFF")
+    dxf_path.parent.mkdir(parents=True, exist_ok=True)
+    doc = ezdxf.new("R2010")
+    doc.header["$INSUNITS"] = 6
+    for error_name, layer_name in DXF_LAYER_BY_ERROR.items():
+        if layer_name not in doc.layers:
+            doc.layers.add(layer_name, color=DXF_COLOR_BY_ERROR.get(error_name, 7))
+    msp = doc.modelspace()
+    for _, row in gdf.iterrows():
+        layer = DXF_LAYER_BY_ERROR.get(row["CLS_NAME"], "CHANGE_ERROR")
+        for poly in iter_polygon_parts(row.geometry):
+            exterior = [(float(x), float(y)) for x, y in poly.exterior.coords]
+            if len(exterior) >= 4:
+                msp.add_lwpolyline(exterior, format="xy", close=True, dxfattribs={"layer": layer})
+            for ring in poly.interiors:
+                coords = [(float(x), float(y)) for x, y in ring.coords]
+                if len(coords) >= 4:
+                    msp.add_lwpolyline(coords, format="xy", close=True, dxfattribs={"layer": layer})
+    doc.saveas(str(dxf_path))
 
-    with raster:
-        input_res = get_input_resolution(raster)
-        height, width, scale_factor, tiles_overlap, windows = compute_tiling_params(raster, config, input_res)
-        indexes = determine_indexes(raster)
 
-        with status.task("Processing Tiles"):
-            mask = process_tiles(args.geotiff, windows, indexes, session, config, progress=progress, total_perc=55, batch_size=args.batch_size)
-            progress.write("Completed Process tiles")
+def export_result_files(
+    result: gpd.GeoDataFrame,
+    output_root: Path,
+    sheet_id: str,
+    args: argparse.Namespace,
+) -> Dict[str, object]:
+    result_dir = output_root / sheet_id
+    result_dir.mkdir(parents=True, exist_ok=True)
+    shp_path = result_dir / f"{sheet_id}_errors.shp"
+    dxf_path = result_dir / f"{sheet_id}_errors.dxf"
+    csv_path = result_dir / f"{sheet_id}_summary.csv"
 
-    with status.task("PostProcessing"):
-        progress.update("PostProcessing", perc=5)
-        # 마스크 후처리
-        mask = median_filter(mask, 5)
-        mask = filter_small_segments(mask, config)
-        mask = morphology_to_mask(mask, open_k=21, close_k=3, iterations=1)
-        mask = morphology_to_mask(mask, open_k=7, close_k=3, iterations=1)
+    if result.empty:
+        write_empty_shapefile(shp_path, args.epsg)
+    else:
+        result.to_file(shp_path, driver="ESRI Shapefile", encoding="utf-8")
+    export_result_dxf(result, dxf_path)
 
-        # GDF 변환 및 후처리
-        inf_gdf = mask_to_gdf(raster, mask, config)
-        inf_gdf = simplify_polygon(inf_gdf, tolerance=0.4, preserve_topology=True)
-        inf_gdf = gpd.GeoDataFrame(geometry=inf_gdf)
+    summary = (
+        result.groupby("CLS_NAME")
+        .agg(count=("geometry", "count"), area=("AREA", "sum"))
+        .reset_index()
+        if not result.empty
+        else pd.DataFrame(columns=["CLS_NAME", "count", "area"])
+    )
+    summary.to_csv(csv_path, index=False, encoding="utf-8-sig")
+    if args.also_geojson:
+        result.to_file(result_dir / f"{sheet_id}_errors.geojson", driver="GeoJSON")
+    return {
+        "sheet_id": sheet_id,
+        "feature_count": int(len(result)),
+        "shp": str(shp_path),
+        "dxf": str(dxf_path),
+        "summary_csv": str(csv_path),
+        "by_class": summary.to_dict(orient="records"),
+    }
 
-        progress.write("Completed PostProcessing")
-    # 변화 탐지 시작
-    with status.task("Generating Graph"):
-        progress.write("Start Change Detection")
-        progress.update("Generating Graph", perc=5)
 
-        # 매칭 전처리
-        prev_gdf = import_shapefile(args.prev_gdf)
-        prev_gdf, inf_gdf, joined = indexing(prev_gdf, inf_gdf)
+def run_change_detection_for_sheet(
+    tif_gdf: gpd.GeoDataFrame,
+    dxf_gdf: gpd.GeoDataFrame,
+    sheet_id: str,
+    dxf_name: str,
+    output_root: Path,
+    args: argparse.Namespace,
+) -> Dict[str, object]:
+    if tif_gdf.empty and dxf_gdf.empty:
+        empty = gpd.GeoDataFrame(geometry=[], crs=f"EPSG:{args.epsg}")
+        return export_result_files(empty, output_root, sheet_id, args)
 
-        # 그래프 생성
-        graph = build_graph(joined)
-        graph = add_energy_to_links(prev_gdf, inf_gdf, graph)
-        component, graph, cut_link, summary = split_graph_by_energy(prev_gdf, inf_gdf, graph, args.cut_threshold)
-        progress.write("Completed Generating Graph")
+    input_root = output_root / "intermediate" / "change_inputs" / sheet_id
+    tif_path = write_match_input(tif_gdf, input_root / "tif", "tif_building", args.epsg)
+    dxf_path = write_match_input(dxf_gdf, input_root / "dxf", "dxf_building", args.epsg)
 
-    with status.task("Cal metrics"):
-        # metrics 계산
-        progress.update("Cal metrics", perc=20)
-        prev_gdf, inf_gdf = mark_cut_links(prev_gdf, inf_gdf, cut_link)
-        prev_gdf, inf_gdf = attach_metrics_from_components(component, prev_gdf, inf_gdf)
+    algorithm, utils, analysis_utils = import_change_detection_modules()
+    _, tif_cd, dxf_cd = algorithm.algorithm_pipeline(
+        str(tif_path),
+        str(dxf_path),
+        str(output_root / "intermediate" / "change_graph" / sheet_id),
+        args.cut_threshold,
+    )
+    tif_cd = utils.assign_cd_class(tif_cd, args.cd_threshold, "cd")
+    tif_cd = utils.assign_class_10(tif_cd, "cd")
+    dxf_cd = utils.assign_cd_class(dxf_cd, args.cd_threshold, "cd")
+    dxf_cd = utils.assign_class_10(dxf_cd, "cd")
 
-        progress.write("Completed Cal metrics")
-    with status.task("Classification"):
-        progress.update("Finalizing", perc=6)
-        # 변화 유형 분류
-        result = cd_pipeline(prev_gdf, inf_gdf, args.cd_threshold)
-        os.makedirs(args.output, exist_ok=True)
-        result.to_file(os.path.join(args.output, "result.json"), driver="GeoJSON", encoding="euc-kr")
-    with status.task("Done"):
-        progress.write("Done")
+    report_dir = output_root / "reports" / sheet_id
+    report_dir.mkdir(parents=True, exist_ok=True)
+    analysis_utils.analysis_pipeline(tif_cd, dxf_cd).to_csv(
+        report_dir / "class_report.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    result = build_error_result(tif_cd, dxf_cd, sheet_id, dxf_name, args.epsg)
+    raw_feature_count = int(len(result))
+    result = filter_result_by_area(result, args.result_min_area_m2, args.epsg)
+    result_meta = export_result_files(result, output_root, sheet_id, args)
+    result_meta["raw_feature_count"] = raw_feature_count
+    result_meta["result_min_area_m2"] = float(args.result_min_area_m2)
+    result_meta["filtered_feature_count"] = raw_feature_count - int(result_meta["feature_count"])
+    return result_meta
+
+
+def prepare_output_dir(output_path: Path, overwrite: bool) -> None:
+    if output_path.exists() and overwrite:
+        shutil.rmtree(output_path)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+
+def cleanup_intermediate_outputs(output_root: Path) -> Dict[str, object]:
+    removed = []
+    for name in ("intermediate", "reports", "visualization"):
+        path = output_root / name
+        if path.exists():
+            shutil.rmtree(path)
+            removed.append(name)
+    for path in (output_root / "dxf_conversion_errors.json",):
+        if path.exists():
+            path.unlink()
+            removed.append(path.name)
+    return {"removed": removed}
+
+
+def process_sheet(
+    conversion: Dict[str, object],
+    index: int,
+    total: int,
+    tif_path: Path,
+    tif_footprint,
+    output_root: Path,
+    args: argparse.Namespace,
+    seg_context: Optional[Tuple[object, object, dict, object]] = None,
+) -> Dict[str, object]:
+    sheet_start = time.time()
+    sheet_id = str(conversion["sheet_id"])
+    dxf_name = Path(str(conversion["dxf_path"])).name
+    log(f"{sheet_id}: start ({index}/{total})")
+
+    dxf_gdf = load_converted_dxf_polygons(conversion, args.epsg)
+    if dxf_gdf.empty:
+        log(f"{sheet_id}: no DXF building polygons in selected categories")
+        empty = gpd.GeoDataFrame(geometry=[], crs=f"EPSG:{args.epsg}")
+        result_meta = export_result_files(empty, output_root, sheet_id, args)
+        result_meta["tif_polygon_count"] = 0
+        result_meta["dxf_polygon_count"] = 0
+        result_meta["raw_feature_count"] = 0
+        result_meta["result_min_area_m2"] = float(args.result_min_area_m2)
+        result_meta["filtered_feature_count"] = 0
+        result_meta["elapsed"] = f"{time.time() - sheet_start:.2f}s"
+        return result_meta
+
+    dxf_union = unary_union(list(dxf_gdf.geometry))
+    processing_area = dxf_union.intersection(tif_footprint)
+    if processing_area.is_empty:
+        log(f"{sheet_id}: no intersection between DXF polygons and TIF footprint")
+        empty = gpd.GeoDataFrame(geometry=[], crs=f"EPSG:{args.epsg}")
+        result_meta = export_result_files(empty, output_root, sheet_id, args)
+        result_meta["tif_polygon_count"] = 0
+        result_meta["dxf_polygon_count"] = int(len(dxf_gdf))
+        result_meta["raw_feature_count"] = 0
+        result_meta["result_min_area_m2"] = float(args.result_min_area_m2)
+        result_meta["filtered_feature_count"] = 0
+        result_meta["elapsed"] = f"{time.time() - sheet_start:.2f}s"
+        return result_meta
+
+    processing_dir = output_root / "intermediate" / "processing_area" / sheet_id
+    processing_dir.mkdir(parents=True, exist_ok=True)
+    gpd.GeoDataFrame({"sheet_id": [sheet_id]}, geometry=[processing_area], crs=f"EPSG:{args.epsg}").to_file(
+        processing_dir / "processing_area.shp",
+        driver="ESRI Shapefile",
+        encoding="utf-8",
+    )
+
+    dxf_clipped = clip_gdf_to_geom(dxf_gdf, processing_area, args.epsg)
+    if seg_context is None:
+        seg_module = load_building_seg_module()
+        model, cfg, device, _, _ = load_building_seg_model(seg_module, args)
+    else:
+        seg_module, model, cfg, device = seg_context
+
+    tif_gdf = run_segmentation_for_area(
+        seg_module=seg_module,
+        model=model,
+        cfg=cfg,
+        device=device,
+        tif_path=tif_path,
+        sheet_id=sheet_id,
+        processing_area=processing_area,
+        output_root=output_root,
+        args=args,
+    )
+    result_meta = run_change_detection_for_sheet(
+        tif_gdf=tif_gdf,
+        dxf_gdf=dxf_clipped,
+        sheet_id=sheet_id,
+        dxf_name=dxf_name,
+        output_root=output_root,
+        args=args,
+    )
+    result_meta["tif_polygon_count"] = int(len(tif_gdf))
+    result_meta["dxf_polygon_count"] = int(len(dxf_clipped))
+    result_meta["elapsed"] = f"{time.time() - sheet_start:.2f}s"
+    log(
+        f"{sheet_id}: done, errors={result_meta['feature_count']} "
+        f"(filtered={result_meta.get('filtered_feature_count', 0)})"
+    )
+    return result_meta
+
+
+def process_sheet_worker(payload: Tuple[Dict[str, object], int, int, str, object, str, argparse.Namespace]) -> Dict[str, object]:
+    conversion, index, total, tif_path_text, tif_footprint, output_root_text, args = payload
+    return process_sheet(
+        conversion=conversion,
+        index=index,
+        total=total,
+        tif_path=Path(tif_path_text),
+        tif_footprint=tif_footprint,
+        output_root=Path(output_root_text),
+        args=args,
+        seg_context=None,
+    )
+
+
+def main() -> None:
+    args = parse_args()
+    output_root = normalize_path(args.output_path)
+    prepare_output_dir(output_root, args.overwrite)
+    status = {
+        "Status": "in progress",
+        "CurrentTask": "init",
+        "ElapsedTime": {},
+        "Results": [],
+    }
+    write_status(output_root, status)
+    t0 = time.time()
+
+    tif_path = resolve_tif_path(args)
+    dxf_paths = resolve_dxf_inputs(args)
+    log(f"TIF: {tif_path}")
+    log(f"DXF count: {len(dxf_paths)}")
+
+    status["CurrentTask"] = "dxf_to_polygon"
+    write_status(output_root, status)
+    dxf_start = time.time()
+    conversions = run_dxf_conversion(dxf_paths, output_root, args)
+    status["ElapsedTime"]["dxf_to_polygon"] = f"{time.time() - dxf_start:.2f}s"
+    write_status(output_root, status)
+
+    status["CurrentTask"] = "load_tif_footprint"
+    write_status(output_root, status)
+    footprint_start = time.time()
+    tif_footprint = raster_valid_footprint(tif_path, args.epsg, args.footprint_max_pixels)
+    if tif_footprint.is_empty:
+        raise RuntimeError("TIF valid footprint is empty")
+    status["ElapsedTime"]["load_tif_footprint"] = f"{time.time() - footprint_start:.2f}s"
+    write_status(output_root, status)
+
+    config_path = normalize_path(args.seg_config)
+    checkpoint_path = normalize_path(args.seg_checkpoint)
+    status["SegmentationConfig"] = str(config_path)
+    status["SegmentationCheckpoint"] = str(checkpoint_path)
+    status["ResultMinAreaM2"] = float(args.result_min_area_m2)
+    sheet_workers = max(1, min(int(args.sheet_workers), len(conversions)))
+    status["SheetWorkers"] = sheet_workers
+    write_status(output_root, status)
+
+    per_sheet_meta = []
+    if sheet_workers == 1:
+        status["CurrentTask"] = "load_segmentation_model"
+        write_status(output_root, status)
+        seg_module = load_building_seg_module()
+        model, cfg, device, _, _ = load_building_seg_model(seg_module, args)
+        seg_context = (seg_module, model, cfg, device)
+        for index, conversion in enumerate(conversions, start=1):
+            status["CurrentTask"] = f"process_sheet:{conversion['sheet_id']}"
+            status["CurrentStep"] = index
+            status["TotalStep"] = len(conversions)
+            write_status(output_root, status)
+            result_meta = process_sheet(
+                conversion=conversion,
+                index=index,
+                total=len(conversions),
+                tif_path=tif_path,
+                tif_footprint=tif_footprint,
+                output_root=output_root,
+                args=args,
+                seg_context=seg_context,
+            )
+            per_sheet_meta.append(result_meta)
+            status["Results"] = sorted(per_sheet_meta, key=lambda item: str(item["sheet_id"]))
+            write_status(output_root, status)
+    else:
+        log(f"Sheet processing start: {len(conversions)} sheet(s), workers={sheet_workers}")
+        status["CurrentTask"] = f"process_sheets_parallel:{sheet_workers}"
+        status["CurrentStep"] = 0
+        status["TotalStep"] = len(conversions)
+        write_status(output_root, status)
+        tasks = [
+            (conversion, index, len(conversions), str(tif_path), tif_footprint, str(output_root), args)
+            for index, conversion in enumerate(conversions, start=1)
+        ]
+        with ProcessPoolExecutor(max_workers=sheet_workers) as executor:
+            future_to_sheet = {
+                executor.submit(process_sheet_worker, task): str(task[0]["sheet_id"])
+                for task in tasks
+            }
+            for future in as_completed(future_to_sheet):
+                sheet_id = future_to_sheet[future]
+                try:
+                    result_meta = future.result()
+                except Exception as exc:
+                    status["Status"] = "failed"
+                    status["CurrentTask"] = f"failed:{sheet_id}"
+                    status["Error"] = str(exc)
+                    write_status(output_root, status)
+                    raise
+                per_sheet_meta.append(result_meta)
+                status["CurrentStep"] = len(per_sheet_meta)
+                status["Results"] = sorted(per_sheet_meta, key=lambda item: str(item["sheet_id"]))
+                write_status(output_root, status)
+
+    status["Status"] = "done"
+    status["CurrentTask"] = "done"
+    status["ElapsedTime"]["total"] = f"{time.time() - t0:.2f}s"
+    status["Results"] = sorted(per_sheet_meta, key=lambda item: str(item["sheet_id"]))
+    if args.keep_intermediate:
+        status["Cleanup"] = {"removed": []}
+    else:
+        status["Cleanup"] = cleanup_intermediate_outputs(output_root)
+    write_status(output_root, status)
+    if not args.keep_status:
+        status_path = output_root / "status.json"
+        if status_path.exists():
+            status_path.unlink()
+    log("All tasks completed")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        print(f"[failed] {exc}", file=sys.stderr)
+        traceback.print_exc()
+        raise

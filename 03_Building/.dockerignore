@@ -1,0 +1,5 @@
+workspace/input/
+workspace/output/
+workspace/model/
+**/__pycache__/
+**/*.pyc
