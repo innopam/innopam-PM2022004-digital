@@ -1,0 +1,3 @@
+PLACEHOLDER MODEL WEIGHTS.
+
+Replace this file with the real DINOv3 model.safetensors before running inference.
