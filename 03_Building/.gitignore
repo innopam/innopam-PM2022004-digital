@@ -16,3 +16,8 @@ Thumbs.db
 *.pyc
 
 *.tar
+
+workspace/output/*
+!workspace/output/.gitkeep
+workspace/**/__pycache__/
+workspace/**/*.pyc

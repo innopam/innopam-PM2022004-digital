@@ -1,0 +1,81 @@
+experiment:
+  name: building_seg_phase2_target_domain_dinov3_vitl16_lvd_lora_last4_upernet
+  output_dir: outputs/building_seg_phase2_target_domain_dinov3_vitl16_lvd_lora_last4_upernet
+  seed: 42
+
+initialization:
+  phase1_checkpoint: outputs/building_seg_phase1_prior_025_dinov3_vitl16_lvd_lora_last4_upernet/REPLACE_WITH_PHASE1_RUN/best.pth
+
+model:
+  backbone:
+    checkpoint_path: ../../model/dinov3-vitl16-pretrain-lvd1689m
+    output_layers: [6, 12, 18, 24]
+    freeze: true
+    drop_path_rate: 0.0
+    lora:
+      enabled: true
+      train_last_n_blocks: 4
+      rank: 16
+      alpha: 32
+      dropout: 0.05
+      target_modules: [q_proj, k_proj, v_proj, o_proj]
+  neck:
+    out_channels: 256
+    scale_factors: [4.0, 2.0, 1.0, 0.5]
+  decoder:
+    ppm_bins: [1, 2, 3, 6]
+    fpn_channels: 256
+    num_classes: 1
+
+training:
+  epochs: 12
+  steps_per_epoch: 900
+  main_batch_size: 10
+  support_batch_size: 4
+  replay_batch_size: 10
+  val_batch_size: 10
+  grad_accum_steps: 1
+  mixed_precision: bf16
+  optimizer:
+    name: adamw
+    lr: 3.0e-5
+    backbone_lr: 1.0e-5
+    betas: [0.9, 0.999]
+    weight_decay: 0.05
+    backbone_weight_decay: 0.05
+  scheduler:
+    name: cosine
+    warmup_epochs: 1
+    min_lr: 1.0e-6
+  loss:
+    seg_bce_weight: 1.0
+    seg_dice_weight: 1.0
+    pos_weight: 2.0
+  mixing:
+    main_weight: 1.0
+    support_weight: 0.25
+    replay_weight: 0.15
+  clip_grad_norm: 1.0
+  log_interval: 50
+
+data:
+  main_train_manifest: data/manifests/phase2_hisup_train_balanced.txt
+  main_val_manifest: data/manifests/phase2_hisup_val_full.txt
+  support_train_manifest: data/manifests/phase2_target_012_train.txt
+  support_val_manifest: data/manifests/phase2_target_012_valid.txt
+  replay_train_manifest: data/manifests/phase1_prior_025_train.txt
+  input_size: 512
+  num_workers: 8
+  pin_memory: true
+  persistent_workers: true
+  aug:
+    random_flip: true
+    random_rotate: true
+    color_jitter: null
+    gaussian_noise_std: 0.0
+    random_scale_range: null
+    normalize_mean: [0.485, 0.456, 0.406]
+    normalize_std: [0.229, 0.224, 0.225]
+
+logging:
+  tensorboard: true
