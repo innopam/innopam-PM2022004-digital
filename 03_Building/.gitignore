@@ -19,5 +19,11 @@ Thumbs.db
 
 workspace/output/*
 !workspace/output/.gitkeep
+!workspace/output/36701075/
+!workspace/output/36701075/**
+!workspace/output/36701076/
+!workspace/output/36701076/**
+!workspace/output/36701077/
+!workspace/output/36701077/**
 workspace/**/__pycache__/
 workspace/**/*.pyc
