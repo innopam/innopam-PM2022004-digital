@@ -117,6 +117,21 @@ def parse_args() -> argparse.Namespace:
         default=25_000_000,
         help="Maximum pixels to read when vectorizing the TIF valid footprint",
     )
+    parser.add_argument(
+        "--processing_area_mode",
+        choices=("bbox", "convex_hull", "union"),
+        default="bbox",
+        help=(
+            "Geometry used to decide the TIF segmentation area for each DXF sheet. "
+            "bbox uses the full extent of DXF building polygons."
+        ),
+    )
+    parser.add_argument(
+        "--processing_bbox_buffer_m",
+        type=float,
+        default=0.0,
+        help="Optional buffer in meters around the per-sheet processing area.",
+    )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--also_geojson", action="store_true")
     parser.add_argument(
@@ -431,12 +446,38 @@ def clip_gdf_to_geom(gdf: gpd.GeoDataFrame, geom, epsg: int) -> gpd.GeoDataFrame
     return fix_polygon_gdf(clipped, epsg)
 
 
+def build_processing_area(
+    dxf_gdf: gpd.GeoDataFrame,
+    tif_footprint,
+    args: argparse.Namespace,
+):
+    if dxf_gdf.empty:
+        return GeometryCollection()
+    if args.processing_area_mode == "union":
+        area_geom = unary_union(list(dxf_gdf.geometry))
+    elif args.processing_area_mode == "convex_hull":
+        area_geom = unary_union(list(dxf_gdf.geometry)).convex_hull
+    else:
+        minx, miny, maxx, maxy = dxf_gdf.total_bounds
+        area_geom = box(float(minx), float(miny), float(maxx), float(maxy))
+    if float(args.processing_bbox_buffer_m) != 0.0:
+        area_geom = area_geom.buffer(float(args.processing_bbox_buffer_m))
+    if area_geom.is_empty:
+        return GeometryCollection()
+    return area_geom.intersection(tif_footprint)
+
+
 def load_building_seg_module():
     return load_python_module(BUILDING_SEG_DIR / "scripts" / "infer_real_ortho.py", "bseg_infer")
 
 
 def load_building_seg_model(seg_module, args: argparse.Namespace):
     import torch
+
+    torch.set_float32_matmul_precision("high")
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
     config_path = normalize_path(args.seg_config)
     checkpoint_path = normalize_path(args.seg_checkpoint)
@@ -787,8 +828,7 @@ def process_sheet(
         result_meta["elapsed"] = f"{time.time() - sheet_start:.2f}s"
         return result_meta
 
-    dxf_union = unary_union(list(dxf_gdf.geometry))
-    processing_area = dxf_union.intersection(tif_footprint)
+    processing_area = build_processing_area(dxf_gdf, tif_footprint, args)
     if processing_area.is_empty:
         log(f"{sheet_id}: no intersection between DXF polygons and TIF footprint")
         empty = gpd.GeoDataFrame(geometry=[], crs=f"EPSG:{args.epsg}")
@@ -837,6 +877,8 @@ def process_sheet(
     )
     result_meta["tif_polygon_count"] = int(len(tif_gdf))
     result_meta["dxf_polygon_count"] = int(len(dxf_clipped))
+    result_meta["processing_area_mode"] = args.processing_area_mode
+    result_meta["processing_area_bounds"] = tuple(round(float(v), 3) for v in processing_area.bounds)
     result_meta["elapsed"] = f"{time.time() - sheet_start:.2f}s"
     log(
         f"{sheet_id}: done, errors={result_meta['feature_count']} "
@@ -898,6 +940,8 @@ def main() -> None:
     status["SegmentationConfig"] = str(config_path)
     status["SegmentationCheckpoint"] = str(checkpoint_path)
     status["ResultMinAreaM2"] = float(args.result_min_area_m2)
+    status["ProcessingAreaMode"] = args.processing_area_mode
+    status["ProcessingAreaBufferM"] = float(args.processing_bbox_buffer_m)
     sheet_workers = max(1, min(int(args.sheet_workers), len(conversions)))
     status["SheetWorkers"] = sheet_workers
     write_status(output_root, status)

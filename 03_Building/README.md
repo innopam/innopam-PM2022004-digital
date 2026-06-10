@@ -165,6 +165,8 @@ python /workspace/main.py \
 - `--seg_threshold`: 건물 mask threshold
 - `--cut_threshold`: polygon matching graph cut threshold
 - `--cd_threshold`: 형상 변화 판정 IoU threshold
+- `--processing_area_mode`: 도엽별 TIF 추론 처리영역 산정 방식. 기본값 `bbox`
+- `--processing_bbox_buffer_m`: 처리영역 외곽 buffer. 기본값 `0`
 - `--keep_intermediate`: 성공 후 중간 산출물과 report 보존
 - `--keep_status`: 성공 후 `status.json` 보존
 - `--also_geojson`: SHP/DXF/CSV 외 GeoJSON도 추가 출력
@@ -195,9 +197,11 @@ repository에는 최근 로컬 검증 결과 예시로 `36701075`, `36701076`, `
 전체 TIF를 통째로 추론하지 않습니다.
 
 1. DXF를 건물 폴리곤으로 변환합니다.
-2. DXF 건물 영역과 TIF valid footprint의 교차 영역을 처리 영역으로 산출합니다.
+2. DXF 건물 폴리곤 전체 BBox와 TIF valid footprint의 교차 영역을 처리 영역으로 산출합니다.
 3. 원본 TIF에서 해당 처리 영역의 raster window만 읽어 segmentation을 수행합니다.
 4. 도엽별로 TIF 기반 폴리곤과 DXF 기반 폴리곤을 비교합니다.
+
+처리영역 기본값은 `bbox`입니다. `union`은 DXF 건물 폴리곤 내부만 추론/clip하므로 DXF에 없는 TIF 건물을 누락시킬 수 있어 기본 운영에는 사용하지 않습니다. 비교 진단이 필요할 때만 `--processing_area_mode union` 또는 `--processing_area_mode convex_hull`을 사용합니다.
 
 도엽별 병렬 처리는 `--sheet_workers`로 조정합니다. 기본값은 `3`입니다.
 
