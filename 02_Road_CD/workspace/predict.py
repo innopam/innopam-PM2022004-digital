@@ -15,6 +15,7 @@ import os
 import subprocess
 import sys
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -264,9 +265,17 @@ def apply_band_scale(band_arr: np.ndarray, scale: tuple, dtype_str: str) -> np.n
     return np.clip(scaled, 0, 255).astype(np.uint8)
 
 
-def read_tile_dtype_safe(src1, src2, clip_x: int, clip_y: int, spec,
-                         scales1: list, scales2: list) -> tuple:
-    """read_tile 대체 — image-level percentile 스케일 적용 + valid 항상 all-true."""
+def read_tile_dtype_safe(
+    src1,
+    src2,
+    clip_x: int,
+    clip_y: int,
+    spec,
+    scales1: list,
+    scales2: list,
+    valid_src=None,
+) -> tuple:
+    """read_tile 대체 — image-level percentile 스케일 적용 + 외부 valid mask 지원."""
     read_window = Window(clip_x + spec.read_x, clip_y + spec.read_y,
                          spec.read_width, spec.read_height)
     raw1 = src1.read(indexes=(1, 2, 3), window=read_window)
@@ -276,6 +285,14 @@ def read_tile_dtype_safe(src1, src2, clip_x: int, clip_y: int, spec,
     t1 = np.moveaxis(np.stack(t1_bands, axis=0), 0, -1)
     t2 = np.moveaxis(np.stack(t2_bands, axis=0), 0, -1)
     valid = np.ones((spec.read_height, spec.read_width), dtype=bool)
+    if valid_src is not None:
+        external_valid = valid_src.read(
+            1,
+            window=read_window,
+            boundless=True,
+            fill_value=0,
+        )
+        valid &= external_valid > 0
     return t1, t2, valid
 
 
@@ -363,13 +380,29 @@ def step_inference(
     pred_pixels_class2 = 0
     max_conf_seen = 0.0
 
+    external_valid_path = t1_path.parent.parent / "_valid_masks" / t1_path.name
+    external_valid_context = (
+        rasterio.open(str(external_valid_path), IGNORE_COG_LAYOUT_BREAK="YES")
+        if external_valid_path.exists()
+        else nullcontext(None)
+    )
+    if external_valid_path.exists():
+        print(f"[valid-mask] {final_name}: using {external_valid_path}", flush=True)
+
     with rasterio.open(str(t1_path), IGNORE_COG_LAYOUT_BREAK="YES") as src1, \
          rasterio.open(str(t2_path), IGNORE_COG_LAYOUT_BREAK="YES") as src2, \
+         external_valid_context as external_valid_src, \
          rasterio.open(str(mask_path), "w", BIGTIFF="YES", **profile) as mask_dst, \
          rasterio.open(str(conf_path), "w", BIGTIFF="YES", **profile) as conf_dst, \
          rasterio.open(str(valid_path), "w", BIGTIFF="YES", **profile) as valid_dst:
 
         # image-level per-band 스케일 1번만 계산 → 모든 타일에 동일 적용 (uint8 은 identity).
+        if external_valid_src is not None and (
+            external_valid_src.width != src1.width
+            or external_valid_src.height != src1.height
+            or external_valid_src.transform != src1.transform
+        ):
+            raise ValueError(f"External valid mask grid mismatch: {external_valid_path}")
         scales1 = compute_image_scales(src1)
         scales2 = compute_image_scales(src2)
         print(
@@ -384,9 +417,16 @@ def step_inference(
             t1_tiles, t2_tiles, valid_tiles = [], [], []
             for spec in batch_specs:
                 # urban_cd_v1.read_tile 의 단순 uint8 캐스팅 회피용 wrapper.
-                # image-level percentile 스케일 + band 4 valid_mask 무시.
+                # image-level percentile 스케일 + 외부 valid mask 적용.
                 t1, t2, v = read_tile_dtype_safe(
-                    src1, src2, clip_x, clip_y, spec, scales1, scales2
+                    src1,
+                    src2,
+                    clip_x,
+                    clip_y,
+                    spec,
+                    scales1,
+                    scales2,
+                    external_valid_src,
                 )
                 t1_tiles.append(t1)
                 t2_tiles.append(t2)
