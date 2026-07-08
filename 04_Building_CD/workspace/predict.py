@@ -560,6 +560,14 @@ def iter_polygons(geom):
     return []
 
 
+def oriented_bbox(polygon):
+    bbox = polygon.minimum_rotated_rectangle
+    bbox = repair_geometry(bbox)
+    if bbox is None or bbox.is_empty or bbox.geom_type != "Polygon":
+        return polygon
+    return bbox
+
+
 @measure_time
 def step_vectorize(
     mask_path: Path,
@@ -610,12 +618,14 @@ def step_vectorize(
                     continue
                 n_after_area += 1
                 conf_val = polygon_mean_probability(prob_srcs[class_id], sub)
-                centroid = sub.centroid
+                bbox = oriented_bbox(sub)
+                centroid = bbox.centroid
                 raw_features.append(
                     {
-                        "polygon": sub,
+                        "polygon": bbox,
                         "class_id": class_id,
-                        "area": float(sub.area),
+                        "area": float(bbox.area),
+                        "source_area": float(sub.area),
                         "conf": conf_val,
                         "cx": centroid.x,
                         "cy": centroid.y,
@@ -639,6 +649,8 @@ def step_vectorize(
                     "CLS_NAME": CLASS_NAME_MAP[feature["class_id"]],
                     "CONF": round(feature["conf"] * 100.0, 2),
                     "AREA": round(feature["area"], 2),
+                    "SOURCE_AREA": round(feature["source_area"], 2),
+                    "GEOMETRY_KIND": "oriented_bbox",
                     "ID": idx,
                 },
                 "geometry": mapping(feature["polygon"]),
@@ -698,6 +710,8 @@ def main() -> None:
                 args.status_file,
                 Status="in progress",
                 final_name=final_name,
+                Process=0,
+                CurrentTask="patch in progress",
             )
 
             (_, clip_window, specs), elapsed_patch = step_patch(
@@ -707,7 +721,7 @@ def main() -> None:
                 args.output_path,
                 args.status_file,
                 Process=20,
-                CurrentTask="patch done",
+                CurrentTask="inference in progress",
                 _elapsed={"패치 생성": f"{round(elapsed_patch, 2)}s"},
             )
 
@@ -730,7 +744,7 @@ def main() -> None:
                 args.output_path,
                 args.status_file,
                 Process=70,
-                CurrentTask="inference done",
+                CurrentTask="reconstruct in progress",
                 _elapsed={"추론": f"{round(elapsed_inf, 2)}s"},
             )
 
@@ -739,7 +753,7 @@ def main() -> None:
                 args.output_path,
                 args.status_file,
                 Process=90,
-                CurrentTask="reconstruct done",
+                CurrentTask="vectorize in progress",
                 _elapsed={"재구성": f"{round(elapsed_rec, 2)}s"},
             )
 
