@@ -3,6 +3,7 @@
 cd ./innopam-PM2022004-digital/02_Road_CD
 
 # 가중치 파일 배치 (별도 전달받은 실제 파일로 교체)
+# 상세 절차는 ../MODEL_SETUP.md 참고.
 # 레포에는 best.pth 이름의 빈 더미 파일이 들어 있음.
 # 추론 코드는 model 폴더의 실제(non-empty) .pth 파일 중 파일명 정렬 기준 첫 번째를 사용함.
 #   - workspace/model/*.pth                                        (학습 가중치, ~1.3GB)
@@ -71,6 +72,7 @@ docker-compose up
 3. output: 추론 결과물 폴더
 
 4. model: 도로 변화탐지 모델 가중치 폴더
+    - fresh clone 후 실제 모델 배치는 `../MODEL_SETUP.md` 를 따른다.
     - `*.pth`: 학습된 가중치 (urban_cd_v1 / DINOv3 ViT-L/16 + UPerNet, Phase 3 class-2)
         - 여러 `.pth` 파일이 있으면 실제(non-empty) 파일 중 파일명 정렬 기준 첫 번째를 사용
     - `dinov3-vitl16-pretrain-lvd1689m/`: DINOv3 backbone (HuggingFace 형식)

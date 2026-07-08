@@ -4,6 +4,7 @@
 cd ./innopam-PM2022004-digital/04_Building_CD
 
 # 가중치 파일 배치 (별도 전달받은 실제 파일로 교체)
+# 상세 절차는 ../MODEL_SETUP.md 참고.
 # 레포에는 best.pth 이름의 빈 더미 파일이 들어 있음.
 # 추론 코드는 model 폴더의 실제(non-empty) .pth 파일 중 파일명 정렬 기준 첫 번째를 사용함.
 #   - workspace/model/*.pth
@@ -70,6 +71,7 @@ docker-compose up
 
 # 모델
 
+- fresh clone 후 실제 모델 배치는 `../MODEL_SETUP.md` 를 따른다.
 - `*.pth`: Building Phase 3 semantic change detector
     - 여러 `.pth` 파일이 있으면 실제(non-empty) 파일 중 파일명 정렬 기준 첫 번째를 사용
     - DINOv3 ViT-L/16 + UPerNet
