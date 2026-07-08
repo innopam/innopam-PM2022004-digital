@@ -23,6 +23,7 @@ import os
 import shutil
 import sys
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Sequence
 
@@ -308,7 +309,16 @@ def apply_band_scale(band_arr: np.ndarray, scale: tuple[float, float], dtype_str
     return np.clip(scaled, 0, 255).astype(np.uint8)
 
 
-def read_tile_dtype_safe(src1, src2, clip_x: int, clip_y: int, spec, scales1: list, scales2: list):
+def read_tile_dtype_safe(
+    src1,
+    src2,
+    clip_x: int,
+    clip_y: int,
+    spec,
+    scales1: list,
+    scales2: list,
+    valid_src=None,
+):
     read_window = Window(clip_x + spec.read_x, clip_y + spec.read_y, spec.read_width, spec.read_height)
     raw1 = src1.read(indexes=(1, 2, 3), window=read_window)
     raw2 = src2.read(indexes=(1, 2, 3), window=read_window)
@@ -317,6 +327,14 @@ def read_tile_dtype_safe(src1, src2, clip_x: int, clip_y: int, spec, scales1: li
     t1 = np.moveaxis(np.stack(t1_bands, axis=0), 0, -1)
     t2 = np.moveaxis(np.stack(t2_bands, axis=0), 0, -1)
     valid = np.ones((spec.read_height, spec.read_width), dtype=bool)
+    if valid_src is not None:
+        external_valid = valid_src.read(
+            1,
+            window=read_window,
+            boundless=True,
+            fill_value=0,
+        )
+        valid &= external_valid > 0
     return t1, t2, valid
 
 
@@ -426,8 +444,18 @@ def step_inference(
     pred_pixels = {class_id: 0 for class_id in CLASS_NAME_MAP}
     max_conf_seen = 0.0
 
+    external_valid_path = t1_path.parent.parent / "_valid_masks" / t1_path.name
+    external_valid_context = (
+        rasterio.open(str(external_valid_path), IGNORE_COG_LAYOUT_BREAK="YES")
+        if external_valid_path.exists()
+        else nullcontext(None)
+    )
+    if external_valid_path.exists():
+        print(f"[valid-mask] {final_name}: using {external_valid_path}", flush=True)
+
     with rasterio.open(str(t1_path), IGNORE_COG_LAYOUT_BREAK="YES") as src1, \
          rasterio.open(str(t2_path), IGNORE_COG_LAYOUT_BREAK="YES") as src2, \
+         external_valid_context as external_valid_src, \
          rasterio.open(str(mask_path), "w", BIGTIFF="YES", **profile) as mask_dst, \
          rasterio.open(str(conf_path), "w", BIGTIFF="YES", **profile) as conf_dst, \
          rasterio.open(str(valid_path), "w", BIGTIFF="YES", **profile) as valid_dst, \
@@ -436,6 +464,12 @@ def step_inference(
          rasterio.open(str(prob_paths[3]), "w", BIGTIFF="YES", **profile) as prob3_dst:
 
         prob_dsts = {1: prob1_dst, 2: prob2_dst, 3: prob3_dst}
+        if external_valid_src is not None and (
+            external_valid_src.width != src1.width
+            or external_valid_src.height != src1.height
+            or external_valid_src.transform != src1.transform
+        ):
+            raise ValueError(f"External valid mask grid mismatch: {external_valid_path}")
         scales1 = compute_image_scales(src1)
         scales2 = compute_image_scales(src2)
         print(
@@ -449,7 +483,16 @@ def step_inference(
             batch_specs = list(specs[start:start + batch_size])
             t1_tiles, t2_tiles, valid_tiles = [], [], []
             for spec in batch_specs:
-                t1, t2, valid = read_tile_dtype_safe(src1, src2, clip_x, clip_y, spec, scales1, scales2)
+                t1, t2, valid = read_tile_dtype_safe(
+                    src1,
+                    src2,
+                    clip_x,
+                    clip_y,
+                    spec,
+                    scales1,
+                    scales2,
+                    external_valid_src,
+                )
                 t1_tiles.append(t1)
                 t2_tiles.append(t2)
                 valid_tiles.append(valid)
