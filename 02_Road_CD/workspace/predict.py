@@ -297,14 +297,15 @@ def log_input_properties(t1_path: Path, t2_path: Path) -> None:
 
 
 def validate_pair_relaxed(t1_path: Path, t2_path: Path) -> PairInfo:
-    """size/band/CRS 일치만 강제. transform 은 검사하지 않음 (기존 02_Road_CD 와 동일).
+    """size/CRS 일치와 최소 RGB 밴드만 강제. transform 은 검사하지 않음.
 
     실제 정사보정 산출물은 픽셀 크기와 origin 이 부동소수 노이즈 수준으로 다를 수 있어
     urban_cd_v1 의 strict equality 체크는 너무 엄격함.
+    RGBA/RGB 조합도 추론은 앞의 3개 밴드만 사용하므로 count 일치는 강제하지 않음.
     """
     with rasterio.open(t1_path, IGNORE_COG_LAYOUT_BREAK="YES") as src1, \
          rasterio.open(t2_path, IGNORE_COG_LAYOUT_BREAK="YES") as src2:
-        for attr in ("width", "height", "count", "crs"):
+        for attr in ("width", "height", "crs"):
             if getattr(src1, attr) != getattr(src2, attr):
                 raise ValueError(f"Raster mismatch for {attr}: "
                                  f"{getattr(src1, attr)} != {getattr(src2, attr)}")
@@ -658,13 +659,14 @@ def main():
             output_json_path = result_dir / f"{final_name}.json"
 
             update_status(args.output_path, args.status_file,
-                          Status="in progress", final_name=final_name)
+                          Status="in progress", final_name=final_name,
+                          Process=0, CurrentTask="patch in progress")
 
             # (1) 패치 (윈도우 좌표 계산)
             (_, clip_window, specs), elapsed_patch = step_patch(
                 t1_path, t2_path, args.patch_size, overlap_px)
             update_status(args.output_path, args.status_file,
-                          Process=20, CurrentTask="patch done",
+                          Process=20, CurrentTask="inference in progress",
                           _elapsed={"패치 생성": f"{round(elapsed_patch, 2)}s"})
 
             # (2) 추론
@@ -673,13 +675,13 @@ def main():
                 result_dir, final_name,
                 args.batch_size, args.confidence_threshold, device)
             update_status(args.output_path, args.status_file,
-                          Process=70, CurrentTask="inference done",
+                          Process=70, CurrentTask="reconstruct in progress",
                           _elapsed={"추론": f"{round(elapsed_inf, 2)}s"})
 
             # (3) 재구성 (no-op, 추론 단계에서 직접 mosaic 작성)
             _, elapsed_rec = step_reconstruct()
             update_status(args.output_path, args.status_file,
-                          Process=90, CurrentTask="reconstruct done",
+                          Process=90, CurrentTask="vectorize in progress",
                           _elapsed={"재구성": f"{round(elapsed_rec, 2)}s"})
 
             # (4) 벡터화
